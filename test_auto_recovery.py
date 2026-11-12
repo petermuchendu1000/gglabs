@@ -494,7 +494,7 @@ class FakeRow:
 
 
 def _domain_stage(row: FakeRow, listing, register=None, available=True, rows=None,
-                  prices=None, balance=(None, None)):
+                  prices=None, balance=(None, None), icann_fee="0"):
     """Run the real register_company_domain against stubbed boundaries.
 
     `rows` is what the rest of the company table looks like - reconciliation
@@ -513,7 +513,7 @@ def _domain_stage(row: FakeRow, listing, register=None, available=True, rows=Non
             else [{"Company Number": "14123456", "Domain": ""}])
         nc.check_domains = lambda lst: [
             {"domain": d, "available": available, "is_premium": False,
-             "registration_price": "0", "icann_fee": "0"} for d in lst]
+             "registration_price": "0", "icann_fee": icann_fee} for d in lst]
         nc.get_existing_account_contact = lambda: {"source": "stub"}
         nc.one_year_price = lambda tld: (prices or {}).get(tld, (None, None))
         nc.available_balance = lambda: balance
@@ -863,6 +863,74 @@ def check_account_rate_beats_list_price(r: Results) -> None:
         nc._price_cache.clear()
 
 
+def _search_with_fees(name, available_names, prices, fees):
+    """Availability results carrying a per-name ICANN fee, as domains.check does."""
+    saved = (nc.check_domains, getattr(nc, "one_year_price", None))
+    try:
+        nc.check_domains = lambda lst: [
+            {"domain": d, "available": d in available_names, "is_premium": False,
+             "registration_price": "0",
+             "icann_fee": fees.get("." + d.split(".", 1)[1], "0")} for d in lst]
+        nc.one_year_price = lambda tld: prices.get(tld, (None, None))
+        return nc.find_cheapest_domain(name)
+    finally:
+        nc.check_domains = saved[0]
+        if saved[1] is not None:
+            nc.one_year_price = saved[1]
+
+
+def check_icann_fee_is_part_of_the_price(r: Results) -> None:
+    """YourPrice does not include the ICANN fee for a gTLD; the bill does.
+
+    domains.check already quotes IcannFee per name and the pipeline parsed it
+    and threw it away, so the balance was compared against a number smaller
+    than the charge.
+    """
+    print("\nprice: the ICANN fee counts")
+    res = _search_with_fees("TAMU TRADERS LTD", {"tamu-traders.site"},
+                            {".site": (1.78, "USD")}, {".site": "0.18"})
+    r.check("the price is the whole charge", res.get("price") == 1.96,
+            f"price={res.get('price')!r} - 1.78 + 0.18")
+    r.check("the base price is still visible", res.get("base_price") == 1.78,
+            f"base_price={res.get('base_price')!r}")
+    r.check("and so is the fee", res.get("icann_fee") == 0.18,
+            f"icann_fee={res.get('icann_fee')!r}")
+
+
+def check_fee_can_change_the_choice(r: Results) -> None:
+    print("\nprice: a big fee beats a small base price")
+    res = _search_with_fees(
+        "TAMU TRADERS LTD", {"tamu-traders.site", "tamu-traders.xyz"},
+        {".site": (1.90, "USD"), ".xyz": (2.00, "USD")},
+        {".site": "0.30", ".xyz": "0.00"})
+    r.check("the cheaper TOTAL wins",
+            res.get("best", {}).get("domain") == "tamu-traders.xyz",
+            f"chose {res.get('best', {}).get('domain')!r} - .site is 1.90+0.30=2.20, "
+            f".xyz is 2.00+0.00")
+
+
+def check_no_fee_quoted_is_unchanged(r: Results) -> None:
+    print("\nprice: no fee quoted means the total is the price")
+    res = _search_with_fees("TAMU TRADERS LTD", {"tamu-traders.site"},
+                            {".site": (1.78, "USD")}, {})
+    r.check("the total is the base price", res.get("price") == 1.78,
+            f"price={res.get('price')!r}")
+
+
+def check_balance_check_includes_the_fee(r: Results) -> None:
+    """The case this exists for: affordable on the base price, not on the bill."""
+    print("\nbalance: the fee is what tips it over")
+    row = FakeRow()
+    out, ordered = _domain_stage(row, _EMPTY,
+                                 prices={".online": (1.78, "USD")},
+                                 balance=(1.90, "USD"), icann_fee="0.18")
+    r.check("NO order was issued", ordered == [],
+            f"{ordered!r} - 1.78 alone is affordable, 1.78 + 0.18 is not")
+    r.check("NO claim was taken", not row.claim_held, f"{row.row!r}")
+    r.check("the operator is shown the whole charge",
+            "1.96" in str(out.get("error", "")), f"{out.get('error')!r}")
+
+
 def check_price_fallback_is_the_old_order(r: Results) -> None:
     print("\nprice: with no prices available, the old TLD order still decides")
     res = _search_priced("TAMU TRADERS LTD",
@@ -1061,6 +1129,10 @@ def main() -> int:
     check_expiry_never_fires_when_recovered(r)
     check_real_prices_decide(r)
     check_account_rate_beats_list_price(r)
+    check_icann_fee_is_part_of_the_price(r)
+    check_fee_can_change_the_choice(r)
+    check_no_fee_quoted_is_unchanged(r)
+    check_balance_check_includes_the_fee(r)
     check_price_fallback_is_the_old_order(r)
     check_unpriced_tld_never_outranks_a_priced_one(r)
     check_insufficient_balance_never_orders(r)
