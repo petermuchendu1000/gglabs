@@ -464,14 +464,24 @@ import db
 class FakeRow:
     """Just enough of db for the claim: one company, one domain_status."""
 
-    def __init__(self, status: str = ""):
+    def __init__(self, status: str = "", aged: bool = False):
         self.row = {"Domain Status": status, "Domain": "", "Domain Cost": ""}
         self.writes: list[dict] = []
+        self.aged = aged                      # has the claim sat for 7 days?
+        self.release_calls: list[int] = []
 
     def claim(self, cn):
         if self.row.get("Domain Status") == db.DOMAIN_CLAIM:
             return False                      # a claim is already outstanding
         self.row["Domain Status"] = db.DOMAIN_CLAIM
+        return True
+
+    def release_expired(self, cn, max_age_days):
+        """Stands in for the single conditional UPDATE in db."""
+        self.release_calls.append(max_age_days)
+        if self.row.get("Domain Status") != db.DOMAIN_CLAIM or not self.aged:
+            return False
+        self.row["Domain Status"] = db.DOMAIN_CLAIM_EXPIRED
         return True
 
     def update(self, cn, updates):
@@ -491,7 +501,8 @@ def _domain_stage(row: FakeRow, listing, register=None, available=True, rows=Non
     """
     saved = (nc.check_domains, nc.get_existing_account_contact, nc.register_domain,
              getattr(nc, "list_account_domains", None),
-             db.claim_domain_purchase, db.update_row, db.all_rows)
+             db.claim_domain_purchase, db.update_row, db.all_rows,
+             getattr(db, "release_expired_claim", None))
     ordered: list[str] = []
     try:
         db.all_rows = lambda use_cache=True: (
@@ -510,15 +521,18 @@ def _domain_stage(row: FakeRow, listing, register=None, available=True, rows=Non
         nc.register_domain = _register
         nc.list_account_domains = lambda: listing
         db.claim_domain_purchase = row.claim
+        db.release_expired_claim = row.release_expired
         db.update_row = row.update
         out = run_pipeline.register_company_domain(
             "TAMU TRADERS LTD", {"company_number": "14123456"})
         return out, ordered
     finally:
         (nc.check_domains, nc.get_existing_account_contact, nc.register_domain,
-         _, db.claim_domain_purchase, db.update_row, db.all_rows) = saved
+         _, db.claim_domain_purchase, db.update_row, db.all_rows, _rel) = saved
         if saved[3] is not None:
             nc.list_account_domains = saved[3]
+        if saved[7] is not None:
+            db.release_expired_claim = saved[7]
 
 
 _OWNED = {"domains": [{"name": "tamu-traders.online"}], "complete": True}
@@ -711,6 +725,69 @@ def _list_with(http):
         nc.requests = saved
 
 
+# ── E. a claim that nothing can resolve expires after a set time ───────────
+#
+# Policy, set by the operator of this pipeline, not derived from anything:
+# SEVEN DAYS. A claim is released only when ALL of these hold:
+#   - the WHOLE account was read and holds no domain this company could have
+#     bought (not_found - never "unknown"),
+#   - no other company holds one of those domains,
+#   - and the row has not been touched for seven days, so the claim is at
+#     least that old.
+# A NonRealTimeDomain registration completes in hours, so a week of silence
+# with nothing in the account is as close to "no purchase exists" as this API
+# can get.
+
+def check_young_claim_is_not_released(r: Results) -> None:
+    print("\nexpiry: a claim younger than the limit is NOT released")
+    row = FakeRow(status=db.DOMAIN_CLAIM, aged=False)
+    out, ordered = _domain_stage(row, _EMPTY)
+    r.check("release was attempted", row.release_calls == [7],
+            f"release calls: {row.release_calls!r}")
+    r.check("...and refused, so the claim is still held", row.claim_held,
+            f"Domain Status is {row.row.get('Domain Status')!r}")
+    r.check("NO order was issued", ordered == [], f"{ordered!r}")
+    r.check("the stage does not succeed", out.get("status") != "registered", f"{out!r}")
+
+
+def check_expired_claim_is_released_and_buys(r: Results) -> None:
+    print("\nexpiry: a seven-day-old claim with nothing in the account releases")
+    row = FakeRow(status=db.DOMAIN_CLAIM, aged=True)
+    out, ordered = _domain_stage(row, _EMPTY)
+    r.check("the seven-day limit was the one applied", row.release_calls == [7],
+            f"release calls: {row.release_calls!r}")
+    r.check("the stage completes by itself", out.get("status") == "registered",
+            f"{out!r}")
+    r.check("exactly ONE order was issued", len(ordered) == 1, f"{ordered!r}")
+    r.check("the row records the new purchase",
+            any(w.get("Domain Status") == "registered" for w in row.writes),
+            f"{row.writes!r}")
+
+
+def check_expiry_never_fires_on_unknown(r: Results) -> None:
+    """The whole safety argument: 'unknown' is not 'nothing was bought'."""
+    print("\nexpiry: never fires when the account could not be read")
+    for label, listing in (("a truncated listing", _TRUNCATED),
+                           ("a failed listing", _BROKEN)):
+        row = FakeRow(status=db.DOMAIN_CLAIM, aged=True)
+        out, ordered = _domain_stage(row, listing)
+        r.check(f"{label}: release is not even attempted", row.release_calls == [],
+                f"release calls: {row.release_calls!r}")
+        r.check(f"{label}: the claim is still held", row.claim_held, f"{row.row!r}")
+        r.check(f"{label}: no order was issued", ordered == [], f"{ordered!r}")
+
+
+def check_expiry_never_fires_when_recovered(r: Results) -> None:
+    print("\nexpiry: never fires when the domain was found in the account")
+    row = FakeRow(status=db.DOMAIN_CLAIM, aged=True)
+    out, ordered = _domain_stage(row, _OWNED)
+    r.check("release is not attempted", row.release_calls == [],
+            f"release calls: {row.release_calls!r}")
+    r.check("the existing domain is used", out.get("domain") == "tamu-traders.online",
+            f"{out!r}")
+    r.check("and nothing is bought", ordered == [], f"{ordered!r}")
+
+
 def check_account_listing_completeness(r: Results) -> None:
     """`complete` is what the whole safety argument rests on.
 
@@ -790,6 +867,10 @@ def main() -> int:
     check_unresolved_without_the_domain_still_stops(r)
     check_another_companys_domain_is_never_claimed(r)
     check_ambiguous_account_is_not_guessed(r)
+    check_young_claim_is_not_released(r)
+    check_expired_claim_is_released_and_buys(r)
+    check_expiry_never_fires_on_unknown(r)
+    check_expiry_never_fires_when_recovered(r)
     check_account_listing_completeness(r)
     check_success_path_unchanged(r)
     return r.report()

@@ -41,6 +41,13 @@ import directors as directors_mod  # officer parsing, shared with api_v2
 # namecheap.domains.create order and its outcome is recorded here, so there
 # is a record of the charge outside the company row itself.
 _money_log = logging.getLogger("money")
+
+# How long an unresolvable purchase claim may stand before it is released so
+# the company can buy again. The operator of this pipeline set it at seven
+# days; it is a policy choice, not a number derived from anything. It only
+# ever applies when the registrar has been read in full and holds no domain
+# for the company - see reconcile_domain_claim and db.release_expired_claim.
+CLAIM_MAX_AGE_DAYS = 7
 try:
     db.ensure_schema()
 except Exception as _e:
@@ -793,13 +800,20 @@ def register_company_domain(company_name, details):
             "error": "company_number missing from details; refusing to buy a "
                      "domain with nowhere to record the purchase",
         }
-    if not db.claim_domain_purchase(cn):
+    claimed = db.claim_domain_purchase(cn)
+    if not claimed:
         # A claim is outstanding, so a domain MAY already have been bought.
         # This used to stop dead and wait for a person to reconcile by hand.
         # Ask the registrar instead: if the domain is sitting in the account,
         # the purchase went through and only the record of it was lost, and
         # the company can carry on with no human at all.
         rec = reconcile_domain_claim(cn, company_name)
+        if rec["status"] == "not_found":
+            # The WHOLE account was read and holds nothing for this company.
+            # Only that answer may age out - "unknown" never reaches here,
+            # because it is the one that cannot rule out a purchase.
+            if db.release_expired_claim(cn, CLAIM_MAX_AGE_DAYS):
+                claimed = db.claim_domain_purchase(cn)
         if rec["status"] == "recovered":
             return {
                 "status": "registered",
@@ -811,19 +825,23 @@ def register_company_domain(company_name, details):
                 "contacts_source": "recovered from the Namecheap account",
                 "alternatives": [],
             }
-        detail = rec.get("error") or (
-            "the whole Namecheap account was read and holds no domain this "
-            "company would have bought, so no purchase completed - but an "
-            "order that was refused or is still pending cannot be ruled out "
-            "from the API, which is why the claim is kept")
-        return {
-            "status": "error",
-            "error": f"a domain purchase for {cn} is already outstanding "
-                     f"(domain_status='{db.DOMAIN_CLAIM}') and could not be "
-                     f"resolved automatically: {detail}. Check the Namecheap "
-                     f"account; clearing domain_status by hand is what lets "
-                     f"this company buy again.",
-        }
+        if not claimed:
+            detail = rec.get("error") or (
+                f"the whole Namecheap account was read and holds no domain "
+                f"this company would have bought, so no purchase completed - "
+                f"but an order that was refused or is still pending cannot be "
+                f"ruled out from the API. The claim is kept, and released "
+                f"automatically once it has stood for {CLAIM_MAX_AGE_DAYS} "
+                f"days with the account still empty of it")
+            return {
+                "status": "error",
+                "error": f"a domain purchase for {cn} is already outstanding "
+                         f"(domain_status='{db.DOMAIN_CLAIM}') and could not "
+                         f"be resolved automatically: {detail}. Clearing "
+                         f"domain_status by hand is what lets this company buy "
+                         f"again sooner.",
+            }
+        # The stale claim aged out and a fresh one was taken: carry on and buy.
 
     # Logged BEFORE the call, not after: if the process dies mid-order this
     # line is the only evidence that money may have moved.

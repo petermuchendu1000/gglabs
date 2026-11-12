@@ -450,6 +450,51 @@ def claim_domain_purchase(cn: str) -> bool:
     return claimed
 
 
+# A claim nothing can resolve is released after this long, so one lost order
+# cannot strand a company for ever. The number of days is the operator's
+# policy choice and is passed in by the caller, not decided here.
+DOMAIN_CLAIM_EXPIRED = "claim_expired"
+
+
+def release_expired_claim(cn: str, max_age_days: int) -> bool:
+    """Release a purchase claim that has sat untouched for max_age_days.
+
+    ONE conditional statement, for the same reason claim_domain_purchase is:
+    a read-then-write would let two attempts both decide the claim had expired
+    and both go on to a billed purchase.
+
+    Age is measured from updated_at, which is a LOWER BOUND on the claim's own
+    age - claim_domain_purchase sets it when it takes the claim (:436) and
+    every later write moves it forward (:387). So this can only ever release
+    later than max_age_days after the claim was taken, never earlier, which is
+    the safe direction to be wrong in.
+
+    The caller must FIRST have established from the registrar that no domain
+    for this company exists. This statement cannot check that and does not try.
+    """
+    cn = _cn8(cn)
+    if not cn or not isinstance(max_age_days, int) or max_age_days < 1:
+        return False
+    with _cursor() as cur:
+        cur.execute(
+            f"UPDATE {TABLE} "
+            f"   SET domain_status = %s, updated_at = now() "
+            f" WHERE company_number = %s "
+            f"   AND domain_status = %s "
+            f"   AND updated_at < now() - make_interval(days => %s)",
+            (DOMAIN_CLAIM_EXPIRED, cn, DOMAIN_CLAIM, max_age_days),
+        )
+        released = cur.rowcount == 1
+    _invalidate()
+    if released:
+        _money_log.warning(
+            "domain purchase claim EXPIRED cn=%s: released after %d days with "
+            "no domain for this company in the Namecheap account, so the next "
+            "run may buy one. If an order from before then is still pending, "
+            "this is where a second charge would come from.", cn, max_age_days)
+    return released
+
+
 def domain_claim_held(cn: str) -> bool:
     """True if an unresolved purchase claim is outstanding for `cn`.
 

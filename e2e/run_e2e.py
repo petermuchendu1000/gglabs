@@ -142,6 +142,16 @@ def main() -> int:
              "with _cursor() as c: c.execute('truncate companies')"],
             env=env, check=True, capture_output=True, timeout=120, cwd=REPO)
 
+        log("checking the seven-day claim release against this database")
+        expiry = subprocess.run(
+            [sys.executable, os.path.join(REPO, "test_claim_expiry_db.py")],
+            env={**env, "ALLOW_DB_WRITE_TEST": "1"}, cwd=REPO,
+            capture_output=True, text=True, timeout=300)
+        print(expiry.stdout.rstrip())
+        if expiry.returncode != 0:
+            print(expiry.stderr.rstrip())
+            raise SystemExit("the claim-expiry checks failed against the database")
+
         with open(MODE_FILE, "w", encoding="utf-8") as f:
             f.write("registered")
 
