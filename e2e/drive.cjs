@@ -123,7 +123,7 @@ async function runStage(page, cn, stage, expect, timeout = 120000) {
     // document that every Status=ERROR leaves nothing charged, so the line
     // records what is known and names the provider's error number.
     results['domain refused shows the reason'] =
-      r.drawer.includes('REFUSED') && r.drawer.includes('claim is KEPT')
+      r.drawer.includes('REFUSED') && r.drawer.includes('claim is HELD')
       && r.drawer.includes('3050900');
     results['domain refused offers an Error Log button'] =
       (await page.locator("#srow-domain button:has-text('Error Log')").count()) > 0;

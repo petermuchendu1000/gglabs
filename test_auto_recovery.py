@@ -493,7 +493,8 @@ class FakeRow:
         return self.row.get("Domain Status") == db.DOMAIN_CLAIM
 
 
-def _domain_stage(row: FakeRow, listing, register=None, available=True, rows=None):
+def _domain_stage(row: FakeRow, listing, register=None, available=True, rows=None,
+                  prices=None, balance=(None, None)):
     """Run the real register_company_domain against stubbed boundaries.
 
     `rows` is what the rest of the company table looks like - reconciliation
@@ -502,7 +503,9 @@ def _domain_stage(row: FakeRow, listing, register=None, available=True, rows=Non
     saved = (nc.check_domains, nc.get_existing_account_contact, nc.register_domain,
              getattr(nc, "list_account_domains", None),
              db.claim_domain_purchase, db.update_row, db.all_rows,
-             getattr(db, "release_expired_claim", None))
+             getattr(db, "release_expired_claim", None),
+             getattr(nc, "one_year_price", None),
+             getattr(nc, "available_balance", None))
     ordered: list[str] = []
     try:
         db.all_rows = lambda use_cache=True: (
@@ -512,6 +515,8 @@ def _domain_stage(row: FakeRow, listing, register=None, available=True, rows=Non
             {"domain": d, "available": available, "is_premium": False,
              "registration_price": "0", "icann_fee": "0"} for d in lst]
         nc.get_existing_account_contact = lambda: {"source": "stub"}
+        nc.one_year_price = lambda tld: (prices or {}).get(tld, (None, None))
+        nc.available_balance = lambda: balance
 
         def _register(d, years=1, registrant_info=None):
             ordered.append(d)
@@ -528,11 +533,16 @@ def _domain_stage(row: FakeRow, listing, register=None, available=True, rows=Non
         return out, ordered
     finally:
         (nc.check_domains, nc.get_existing_account_contact, nc.register_domain,
-         _, db.claim_domain_purchase, db.update_row, db.all_rows, _rel) = saved
+         _, db.claim_domain_purchase, db.update_row, db.all_rows, _rel,
+         _price, _bal) = saved
         if saved[3] is not None:
             nc.list_account_domains = saved[3]
         if saved[7] is not None:
             db.release_expired_claim = saved[7]
+        if saved[8] is not None:
+            nc.one_year_price = saved[8]
+        if saved[9] is not None:
+            nc.available_balance = saved[9]
 
 
 _OWNED = {"domains": [{"name": "tamu-traders.online"}], "complete": True}
@@ -788,6 +798,184 @@ def check_expiry_never_fires_when_recovered(r: Results) -> None:
     r.check("and nothing is bought", ordered == [], f"{ordered!r}")
 
 
+# ── F. what it costs, what we can spend, and a refusal that says no order ──
+
+def _search_priced(name, available_names, prices):
+    saved = (nc.check_domains, getattr(nc, "one_year_price", None))
+    try:
+        stub, _ = _availability(available_names)
+        nc.check_domains = stub
+        nc.one_year_price = lambda tld: prices.get(tld, (None, None))
+        return nc.find_cheapest_domain(name)
+    finally:
+        nc.check_domains = saved[0]
+        if saved[1] is not None:
+            nc.one_year_price = saved[1]
+
+
+def check_real_prices_decide(r: Results) -> None:
+    """"Cheapest" came from a COMMENT, not from Namecheap.
+
+    CHEAP_TLDS is ordered by prices written in a comment above it, and the
+    sort key was position in that list. Nothing in the pipeline ever asked
+    what a domain costs - which is how an account with $2.20 in it issued an
+    order it could not pay for.
+    """
+    print("\nprice: the cheapest TLD is the one that is actually cheapest")
+    res = _search_priced(
+        "TAMU TRADERS LTD",
+        {"tamu-traders.online", "tamu-traders.site", "tamu-traders.xyz"},
+        {".online": (5.00, "USD"), ".site": (1.00, "USD"), ".xyz": (2.00, "USD")})
+    r.check("the genuinely cheapest name is chosen",
+            res.get("best", {}).get("domain") == "tamu-traders.site",
+            f"chose {res.get('best', {}).get('domain')!r} - .online is first in "
+            f"CHEAP_TLDS but costs five times as much here")
+    r.check("its price comes back with it", res.get("price") == 1.00,
+            f"price={res.get('price')!r}")
+    r.check("...and the currency", res.get("currency") == "USD",
+            f"currency={res.get('currency')!r}")
+
+
+def check_account_rate_beats_list_price(r: Results) -> None:
+    """YourPrice is what THIS account pays; Price and RegularPrice are list.
+
+    Taking the list price would both pick the wrong "cheapest" and, now that
+    the balance is checked against it, refuse to buy things the account can
+    in fact afford.
+    """
+    print("\nprice: this account's rate is the one used")
+    saved = nc.get_pricing
+    try:
+        nc._price_cache.clear()
+        nc.get_pricing = lambda tld="com": {"tld": tld, "prices": [
+            {"duration": "2", "duration_type": "YEAR", "your_price": "0.50",
+             "price": "0.50", "regular_price": "0.50", "currency": "USD"},
+            {"duration": "1", "duration_type": "YEAR", "your_price": "1.11",
+             "price": "7.77", "regular_price": "9.99", "currency": "USD"},
+        ]}
+        price, currency = nc.one_year_price(".online")
+        r.check("the one-year REGISTER rate is taken", price == 1.11,
+                f"got {price!r} - 7.77 is the list price, 9.99 the regular "
+                f"price, and 0.50 is a two-year rate")
+        r.check("with its currency", currency == "USD", f"got {currency!r}")
+    finally:
+        nc.get_pricing = saved
+        nc._price_cache.clear()
+
+
+def check_price_fallback_is_the_old_order(r: Results) -> None:
+    print("\nprice: with no prices available, the old TLD order still decides")
+    res = _search_priced("TAMU TRADERS LTD",
+                         {"tamu-traders.online", "tamu-traders.com"}, {})
+    r.check("the hardcoded order is the fallback",
+            str(res.get("best", {}).get("domain", "")).endswith(".online"),
+            f"chose {res.get('best', {}).get('domain')!r}")
+    r.check("and no price is claimed", res.get("price") is None,
+            f"price={res.get('price')!r}")
+
+
+def check_unpriced_tld_never_outranks_a_priced_one(r: Results) -> None:
+    print("\nprice: a TLD whose price is unknown does not jump the queue")
+    res = _search_priced("TAMU TRADERS LTD",
+                         {"tamu-traders.online", "tamu-traders.site"},
+                         {".site": (1.00, "USD")})       # .online unknown
+    r.check("the known-priced name wins",
+            res.get("best", {}).get("domain") == "tamu-traders.site",
+            f"chose {res.get('best', {}).get('domain')!r}")
+
+
+def check_insufficient_balance_never_orders(r: Results) -> None:
+    """The point of the whole change: find out BEFORE taking a claim."""
+    print("\nbalance: too little money means no claim and no order")
+    row = FakeRow()
+    out, ordered = _domain_stage(row, _EMPTY,
+                                 prices={".online": (5.00, "USD")},
+                                 balance=(2.20, "USD"))
+    r.check("NO order was issued", ordered == [], f"{ordered!r}")
+    r.check("NO claim was taken", not row.claim_held,
+            f"Domain Status is {row.row.get('Domain Status')!r}; a claim taken "
+            f"here is one a person has to clear afterwards")
+    r.check("the stage reports an error", out.get("status") == "error", f"{out!r}")
+    r.check("the operator is told both numbers",
+            "2.2" in str(out.get("error")) and "5.0" in str(out.get("error")),
+            f"{out.get('error')!r}")
+
+
+def check_sufficient_balance_proceeds(r: Results) -> None:
+    print("\nbalance: enough money and it carries on")
+    row = FakeRow()
+    out, ordered = _domain_stage(row, _EMPTY,
+                                 prices={".online": (1.00, "USD")},
+                                 balance=(2.20, "USD"))
+    r.check("the order goes ahead", len(ordered) == 1, f"{ordered!r}")
+    r.check("and succeeds", out.get("status") == "registered", f"{out!r}")
+
+
+def check_unknown_balance_does_not_block(r: Results) -> None:
+    """A balance the API will not give us must not stop the pipeline: the
+    order itself is the backstop, and its refusal is handled."""
+    print("\nbalance: an unreadable balance does not block the purchase")
+    row = FakeRow()
+    out, ordered = _domain_stage(row, _EMPTY,
+                                 prices={".online": (1.00, "USD")},
+                                 balance=(None, None))
+    r.check("the order still goes ahead", len(ordered) == 1, f"{ordered!r}")
+
+
+def check_currency_mismatch_does_not_block(r: Results) -> None:
+    print("\nbalance: a currency we cannot compare is treated as unknown")
+    row = FakeRow()
+    out, ordered = _domain_stage(row, _EMPTY,
+                                 prices={".online": (5.00, "USD")},
+                                 balance=(2.20, "EUR"))
+    r.check("the order goes ahead rather than being refused on a bad comparison",
+            len(ordered) == 1, f"{ordered!r}")
+
+
+_NO_ORDER_ERR = ("Registration failed: ['2528166: ORDER CREATION FAILED; "
+                 "INSUFFICIENTFUNDS;Insufficient funds in account']")
+
+
+def check_order_creation_failed_releases_the_claim(r: Results) -> None:
+    """AUTHORIZED. Namecheap says in words that no order was created, and
+    reconciliation agrees the account holds nothing. Two independent things
+    have to say so before the claim goes."""
+    print("\nrefusal: ORDER CREATION FAILED releases the claim")
+    row = FakeRow()
+    out, ordered = _domain_stage(
+        row, _EMPTY, register=lambda d: {"error": _NO_ORDER_ERR,
+                                         "error_numbers": ["2528166"]})
+    r.check("one order was attempted", len(ordered) == 1, f"{ordered!r}")
+    r.check("the claim is RELEASED", not row.claim_held,
+            f"Domain Status is {row.row.get('Domain Status')!r}")
+    r.check("the operator is told it was released",
+            "released" in str(out.get("error", "")).lower(), f"{out!r}")
+
+
+def check_order_creation_failed_keeps_claim_when_unknown(r: Results) -> None:
+    """Both conditions, not either. If the account could not be read, the
+    provider's wording is not enough on its own."""
+    print("\nrefusal: ...but not when the account could not be read")
+    row = FakeRow()
+    out, ordered = _domain_stage(
+        row, _TRUNCATED, register=lambda d: {"error": _NO_ORDER_ERR,
+                                             "error_numbers": ["2528166"]})
+    r.check("the claim is KEPT", row.claim_held,
+            f"Domain Status is {row.row.get('Domain Status')!r}")
+
+
+def check_other_refusals_still_keep_the_claim(r: Results) -> None:
+    print("\nrefusal: an unknown-outcome code still keeps the claim")
+    row = FakeRow()
+    out, ordered = _domain_stage(
+        row, _EMPTY,
+        register=lambda d: {"error": "Registration failed: "
+                                     "['3050900: Unknown response from provider']",
+                            "error_numbers": ["3050900"]})
+    r.check("the claim is KEPT", row.claim_held,
+            f"Domain Status is {row.row.get('Domain Status')!r}")
+
+
 def check_account_listing_completeness(r: Results) -> None:
     """`complete` is what the whole safety argument rests on.
 
@@ -871,6 +1059,17 @@ def main() -> int:
     check_expired_claim_is_released_and_buys(r)
     check_expiry_never_fires_on_unknown(r)
     check_expiry_never_fires_when_recovered(r)
+    check_real_prices_decide(r)
+    check_account_rate_beats_list_price(r)
+    check_price_fallback_is_the_old_order(r)
+    check_unpriced_tld_never_outranks_a_priced_one(r)
+    check_insufficient_balance_never_orders(r)
+    check_sufficient_balance_proceeds(r)
+    check_unknown_balance_does_not_block(r)
+    check_currency_mismatch_does_not_block(r)
+    check_order_creation_failed_releases_the_claim(r)
+    check_order_creation_failed_keeps_claim_when_unknown(r)
+    check_other_refusals_still_keep_the_claim(r)
     check_account_listing_completeness(r)
     check_success_path_unchanged(r)
     return r.report()
