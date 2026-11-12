@@ -8,6 +8,7 @@ API Docs: https://www.namecheap.com/support/api/methods/
 
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 try:
     import requests
@@ -190,6 +191,67 @@ def _domain_bases(company_name):
     return bases[:max(1, MAX_CANDIDATES // len(CHEAP_TLDS))]
 
 
+_PRICE_TTL = 6 * 3600          # prices do not move hourly
+_price_cache: dict = {}        # tld -> (expires_at, price, currency)
+
+
+def _money(value):
+    """'1,234.56' / '$2.20' / '' -> float, or None. Never raises."""
+    s = re.sub(r"[^0-9.]", "", str(value or ""))
+    if not s or s.count(".") > 1:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def one_year_price(tld):
+    """(price, currency) to REGISTER this TLD for a year, or (None, None).
+
+    What a domain costs used to come from a COMMENT above CHEAP_TLDS, and the
+    choice was made by position in that list. Nothing ever asked Namecheap.
+    That is how an account with $2.20 in it issued an order it could not pay
+    for: the comment said .online was $0.98.
+
+    Unknown is cached too, so a provider that will not answer is asked once
+    every few hours rather than once per company.
+    """
+    key = str(tld or "").lstrip(".").lower()
+    if not key:
+        return None, None
+    now = time.time()
+    hit = _price_cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1], hit[2]
+
+    data = get_pricing(key)
+    price = currency = None
+    if "error" not in data:
+        for p in data.get("prices", []):
+            if (str(p.get("duration") or "") != "1"
+                    or str(p.get("duration_type") or "").upper() != "YEAR"):
+                continue
+            # your_price is this account's rate; the others are list prices.
+            for field in ("your_price", "price", "regular_price"):
+                price = _money(p.get(field))
+                if price is not None:
+                    currency = str(p.get("currency") or "USD").upper()
+                    break
+            if price is not None:
+                break
+    _price_cache[key] = (now + _PRICE_TTL, price, currency)
+    return price, currency
+
+
+def available_balance():
+    """(amount, currency) the account can spend now, or (None, None)."""
+    bal = get_balance()
+    if "error" in bal:
+        return None, None
+    return _money(bal.get("available")), str(bal.get("currency") or "USD").upper()
+
+
 def find_cheapest_domain(company_name):
     """
     Given a company name, generate domain candidates and find the cheapest available one.
@@ -217,11 +279,31 @@ def find_cheapest_domain(company_name):
                 return i
         return 99
 
-    # Price first, then how well the label spells the company: among equally
-    # cheap TLDs the name itself beats "name-ltd", which beats the initials.
-    available.sort(key=lambda d: (tld_priority(d),
-                                  base_rank.get(d["domain"].split(".")[0], 99)))
-    return {"best": available[0], "alternatives": available[1:5]}
+    # The REAL price first, asked of Namecheap, then how well the label
+    # spells the company. CHEAP_TLDS' order is now only a tie-break for names
+    # whose price the provider would not give us, and an unpriced name never
+    # outranks a priced one - otherwise a TLD that quietly became expensive
+    # would still be picked because a comment said it was cheap.
+    prices = {}
+    for d in available:
+        tld = "." + d["domain"].split(".", 1)[1]
+        if tld not in prices:
+            prices[tld] = one_year_price(tld)
+
+    def rank(d):
+        tld = "." + d["domain"].split(".", 1)[1]
+        price = prices.get(tld, (None, None))[0]
+        return (0 if price is not None else 1,
+                price if price is not None else 0.0,
+                tld_priority(d),
+                base_rank.get(d["domain"].split(".")[0], 99))
+
+    available.sort(key=rank)
+    best = available[0]
+    best_price, best_currency = prices.get(
+        "." + best["domain"].split(".", 1)[1], (None, None))
+    return {"best": best, "price": best_price, "currency": best_currency,
+            "alternatives": available[1:5]}
 
 
 def _company_name_to_domain(company_name):

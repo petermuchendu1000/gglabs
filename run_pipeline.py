@@ -739,6 +739,7 @@ def reconcile_domain_claim(cn, company_name, attempted=""):
 def register_company_domain(company_name, details):
     """Find cheapest domain and register it for a company."""
     from namecheap_automation import (
+        available_balance,
         find_cheapest_domain,
         get_existing_account_contact,
         register_domain,
@@ -751,6 +752,36 @@ def register_company_domain(company_name, details):
 
     best = search_result["best"]
     domain = best["domain"]
+
+    # Can the account actually pay for it? Asked BEFORE a claim is taken and
+    # before any order, because the alternative is what happened in
+    # production: a billed order refused for INSUFFICIENTFUNDS, leaving a
+    # purchase claim for somebody to clear. A balance the API will not give
+    # us, or one in a currency that cannot be compared with the price, is not
+    # a reason to stop - the order itself is the backstop, and its refusal is
+    # handled.
+    price = search_result.get("price")
+    currency = search_result.get("currency")
+    if price is not None:
+        funds, funds_currency = available_balance()
+        if funds is not None and funds_currency == currency and funds < price:
+            _money_log.warning(
+                "domain purchase NOT ATTEMPTED cn=%s domain=%s: %s %.2f "
+                "available, %s %.2f needed. No claim taken, no order issued.",
+                str(details.get("company_number") or "").strip(), domain,
+                funds_currency, funds, currency, price)
+            return {
+                "status": "error",
+                "error": (f"insufficient funds: the Namecheap account has "
+                          f"{funds_currency} {funds:.2f} available and "
+                          f"{domain} costs {currency} {price:.2f}. No order "
+                          f"was attempted and no purchase claim was taken, so "
+                          f"there is nothing to clear - top the account up and "
+                          f"run this stage again."),
+                "attempted_domain": domain,
+                "price": price,
+                "available": funds,
+            }
 
     # Domain registration contact should match the configured Namecheap account
     # when possible. Fall back to Companies House/director details only if the
@@ -867,10 +898,9 @@ def register_company_domain(company_name, details):
         # asserting that no money moved.
         _money_log.warning(
             "domain order REFUSED cn=%s domain=%s; no order was returned to "
-            "record and the claim is KEPT, because a refusal does not "
-            "establish that nothing was charged. Provider error %s. "
-            "Reconciling against the account now.",
-            cn, domain, reg_result["error"])
+            "record. The claim is HELD while the account is checked, because "
+            "a refusal does not by itself establish that nothing was charged. "
+            "Provider error %s", cn, domain, reg_result["error"])
         # The claim is KEPT. It used to be released here by writing
         # domain_status='error', on the strength of "Namecheap rejected the
         # order, so nothing was charged" - which Namecheap does not say, and
@@ -893,6 +923,42 @@ def register_company_domain(company_name, details):
                 "contacts_source": "recovered from the Namecheap account",
                 "alternatives": [],
             }
+        # AUTHORIZED: release the claim when TWO independent things agree that
+        # no order exists - Namecheap saying so in words ("ORDER CREATION
+        # FAILED", as it does for 2528166 INSUFFICIENTFUNDS), and the account
+        # itself holding no domain for this company. Either one alone is not
+        # enough: the wording is a string from a provider whose full error
+        # table I could not obtain, and a reconciliation that could not read
+        # the account proves nothing.
+        said_no_order = "order creation failed" in str(
+            reg_result.get("error") or "").lower()
+        if said_no_order and rec["status"] == "not_found":
+            _money_log.warning(
+                "domain order claim RELEASED cn=%s domain=%s: Namecheap "
+                "reported ORDER CREATION FAILED and the account holds no "
+                "domain for this company, so no order exists to be charged "
+                "for. Provider error %s", cn, domain, reg_result["error"])
+            db.update_row(cn, {"Domain Status": "error"})
+            return {
+                "status": "error",
+                "error": f"{reg_result['error']} (attempted domain: {domain}). "
+                         f"The purchase claim was RELEASED: Namecheap reported "
+                         f"ORDER CREATION FAILED and the account holds no "
+                         f"domain for this company, so there is nothing to "
+                         f"reconcile. Fix the cause and run this stage again.",
+                "attempted_domain": domain,
+            }
+        # Every refusal logs exactly one outcome after the HELD line above, so
+        # the audit trail can never be read two ways.
+        _money_log.error(
+            "domain order claim KEPT cn=%s domain=%s: %s. Released "
+            "automatically once it has stood for %d days with the account "
+            "still holding no domain for this company.",
+            cn, domain,
+            rec.get("error") or "the account holds no domain for this company, "
+                                "but Namecheap did not say that no order was "
+                                "created",
+            CLAIM_MAX_AGE_DAYS)
         return {
             "status": "error",
             "error": f"{reg_result['error']} (attempted domain: {domain}). The "
