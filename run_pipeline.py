@@ -770,14 +770,18 @@ def register_company_domain(company_name, details):
                 "available, %s %.2f needed. No claim taken, no order issued.",
                 str(details.get("company_number") or "").strip(), domain,
                 funds_currency, funds, currency, price)
+            fee = search_result.get("icann_fee") or 0.0
+            base = search_result.get("base_price")
+            breakdown = (f" ({currency} {base:.2f} + {currency} {fee:.2f} "
+                         f"ICANN fee)" if fee and base is not None else "")
             return {
                 "status": "error",
                 "error": (f"insufficient funds: the Namecheap account has "
                           f"{funds_currency} {funds:.2f} available and "
-                          f"{domain} costs {currency} {price:.2f}. No order "
-                          f"was attempted and no purchase claim was taken, so "
-                          f"there is nothing to clear - top the account up and "
-                          f"run this stage again."),
+                          f"{domain} costs {currency} {price:.2f}{breakdown}. "
+                          f"No order was attempted and no purchase claim was "
+                          f"taken, so there is nothing to clear - top the "
+                          f"account up and run this stage again."),
                 "attempted_domain": domain,
                 "price": price,
                 "available": funds,

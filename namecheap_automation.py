@@ -290,19 +290,41 @@ def find_cheapest_domain(company_name):
         if tld not in prices:
             prices[tld] = one_year_price(tld)
 
+    def total_cost(d):
+        """What the name will actually be billed at: the TLD's price plus any
+        ICANN fee quoted for it.
+
+        users.getPricing's YourPrice does not carry the ICANN fee a gTLD is
+        charged on top, and domains.check quotes it per NAME - which is why it
+        comes from the availability result rather than from the pricing call.
+        It was parsed and thrown away, so the balance was being compared
+        against a number smaller than the charge.
+
+        When the provider quotes no fee the total is the price, exactly as
+        before. The total is therefore a LOWER bound on the bill, never an
+        over-estimate that would refuse a purchase the account can afford.
+        """
+        price = prices.get("." + d["domain"].split(".", 1)[1], (None, None))[0]
+        if price is None:
+            return None
+        return price + (_money(d.get("icann_fee")) or 0.0)
+
     def rank(d):
-        tld = "." + d["domain"].split(".", 1)[1]
-        price = prices.get(tld, (None, None))[0]
-        return (0 if price is not None else 1,
-                price if price is not None else 0.0,
+        total = total_cost(d)
+        return (0 if total is not None else 1,
+                total if total is not None else 0.0,
                 tld_priority(d),
                 base_rank.get(d["domain"].split(".")[0], 99))
 
     available.sort(key=rank)
     best = available[0]
-    best_price, best_currency = prices.get(
+    best_base, best_currency = prices.get(
         "." + best["domain"].split(".", 1)[1], (None, None))
-    return {"best": best, "price": best_price, "currency": best_currency,
+    return {"best": best,
+            "price": total_cost(best),          # what will be billed
+            "base_price": best_base,
+            "icann_fee": _money(best.get("icann_fee")) or 0.0,
+            "currency": best_currency,
             "alternatives": available[1:5]}
 
 
