@@ -446,6 +446,319 @@ def check_operator_sees_the_number(r: Results) -> None:
          db.claim_domain_purchase, db.update_row) = saved
 
 
+# ── D. a purchase claim resolves itself against the registrar ──────────────
+#
+# Keeping the claim on a refusal whose outcome is unknown is what stops a
+# second charge. On its own it would also stop the pipeline until a person
+# checked the Namecheap account by hand. So the thing that resolves a kept
+# claim is the registrar itself: the pipeline asks what it owns before it
+# ever asks for a person.
+#
+# The one answer that must never be guessed is "we do not own it". A listing
+# that failed, or that may have been truncated, is UNKNOWN - because
+# "not ours" is the answer that lets a second domain be bought.
+
+import db
+
+
+class FakeRow:
+    """Just enough of db for the claim: one company, one domain_status."""
+
+    def __init__(self, status: str = ""):
+        self.row = {"Domain Status": status, "Domain": "", "Domain Cost": ""}
+        self.writes: list[dict] = []
+
+    def claim(self, cn):
+        if self.row.get("Domain Status") == db.DOMAIN_CLAIM:
+            return False                      # a claim is already outstanding
+        self.row["Domain Status"] = db.DOMAIN_CLAIM
+        return True
+
+    def update(self, cn, updates):
+        self.writes.append(dict(updates))
+        self.row.update(updates)
+
+    @property
+    def claim_held(self):
+        return self.row.get("Domain Status") == db.DOMAIN_CLAIM
+
+
+def _domain_stage(row: FakeRow, listing, register=None, available=True, rows=None):
+    """Run the real register_company_domain against stubbed boundaries.
+
+    `rows` is what the rest of the company table looks like - reconciliation
+    reads it to be sure a domain is not already another company's.
+    """
+    saved = (nc.check_domains, nc.get_existing_account_contact, nc.register_domain,
+             getattr(nc, "list_account_domains", None),
+             db.claim_domain_purchase, db.update_row, db.all_rows)
+    ordered: list[str] = []
+    try:
+        db.all_rows = lambda use_cache=True: (
+            rows if rows is not None
+            else [{"Company Number": "14123456", "Domain": ""}])
+        nc.check_domains = lambda lst: [
+            {"domain": d, "available": available, "is_premium": False,
+             "registration_price": "0", "icann_fee": "0"} for d in lst]
+        nc.get_existing_account_contact = lambda: {"source": "stub"}
+
+        def _register(d, years=1, registrant_info=None):
+            ordered.append(d)
+            return (register or (lambda dom: {"registered": True, "charged": "8.88",
+                                              "domain_id": "d1", "order_id": "o1"}))(d)
+
+        nc.register_domain = _register
+        nc.list_account_domains = lambda: listing
+        db.claim_domain_purchase = row.claim
+        db.update_row = row.update
+        out = run_pipeline.register_company_domain(
+            "TAMU TRADERS LTD", {"company_number": "14123456"})
+        return out, ordered
+    finally:
+        (nc.check_domains, nc.get_existing_account_contact, nc.register_domain,
+         _, db.claim_domain_purchase, db.update_row, db.all_rows) = saved
+        if saved[3] is not None:
+            nc.list_account_domains = saved[3]
+
+
+_OWNED = {"domains": [{"name": "tamu-traders.online"}], "complete": True}
+_EMPTY = {"domains": [], "complete": True}
+_TRUNCATED = {"domains": [{"name": "somebody-else.online"}], "complete": False}
+_BROKEN = {"error": "Failed: ['5019169: Unknown exceptions while retrieving Domain list']"}
+
+
+def check_outstanding_claim_resolves_itself(r: Results) -> None:
+    print("\nclaim: an outstanding claim whose domain DID land resolves itself")
+    row = FakeRow(status=db.DOMAIN_CLAIM)
+    out, ordered = _domain_stage(row, _OWNED)
+    r.check("the stage succeeds without a person", out.get("status") == "registered",
+            f"{out!r}")
+    r.check("it is the domain the account actually holds",
+            out.get("domain") == "tamu-traders.online", f"{out!r}")
+    r.check("NO second order was issued", ordered == [],
+            f"orders issued: {ordered!r}")
+    r.check("the claim is resolved", not row.claim_held,
+            f"Domain Status is {row.row.get('Domain Status')!r}")
+
+
+def check_outstanding_claim_without_a_domain_stops(r: Results) -> None:
+    print("\nclaim: an outstanding claim with nothing in the account still stops")
+    row = FakeRow(status=db.DOMAIN_CLAIM)
+    out, ordered = _domain_stage(row, _EMPTY)
+    r.check("the stage does not succeed", out.get("status") != "registered", f"{out!r}")
+    r.check("NO order was issued", ordered == [], f"orders issued: {ordered!r}")
+    r.check("the claim is still held", row.claim_held,
+            f"Domain Status is {row.row.get('Domain Status')!r}")
+    r.check("the operator is told the account was checked",
+            "account" in str(out.get("error", "")).lower(), f"{out!r}")
+
+
+def check_truncated_listing_is_not_proof(r: Results) -> None:
+    print("\nclaim: a truncated listing is UNKNOWN, never 'not ours'")
+    row = FakeRow(status=db.DOMAIN_CLAIM)
+    out, ordered = _domain_stage(row, _TRUNCATED)
+    r.check("no order was issued", ordered == [], f"orders issued: {ordered!r}")
+    r.check("the claim is still held", row.claim_held, f"{row.row!r}")
+    # Asserted against the RECONCILIATION verdict, not the wrapper around it:
+    # "could not be resolved automatically" appears either way, so matching it
+    # proved nothing. Only the unknown path says the listing was incomplete,
+    # and only the not_found path claims the account was read whole.
+    err = str(out.get("error", "")).lower()
+    r.check("the answer says the listing was incomplete",
+            "incomplete" in err, f"{out!r}")
+    r.check("...and does NOT claim the account was read whole",
+            "whole namecheap account was read" not in err, f"{out!r}")
+
+
+def check_failed_listing_is_not_proof(r: Results) -> None:
+    print("\nclaim: a failed listing is UNKNOWN too")
+    row = FakeRow(status=db.DOMAIN_CLAIM)
+    out, ordered = _domain_stage(row, _BROKEN)
+    r.check("no order was issued", ordered == [], f"orders issued: {ordered!r}")
+    r.check("the claim is still held", row.claim_held, f"{row.row!r}")
+    r.check("the provider's failure is passed on",
+            "5019169" in str(out.get("error", "")), f"{out!r}")
+
+
+def check_refusal_keeps_the_claim(r: Results) -> None:
+    """AUTHORIZED CHANGE. A refused order used to release the claim, which let
+    the next run buy again on the strength of 'Namecheap said no, so nothing
+    was charged' - which Namecheap does not say."""
+    print("\nrefusal: the claim is KEPT, not released")
+    row = FakeRow()
+    out, ordered = _domain_stage(
+        row, _EMPTY,
+        register=lambda d: {"error": "Registration failed: "
+                                     "['3050900: Unknown response from provider']",
+                            "error_numbers": ["3050900"]})
+    r.check("one order was attempted", len(ordered) == 1, f"{ordered!r}")
+    r.check("the stage reports an error", out.get("status") == "error", f"{out!r}")
+    r.check("the claim is KEPT", row.claim_held,
+            f"Domain Status is {row.row.get('Domain Status')!r}; releasing it is "
+            f"what let a second order be issued")
+    r.check("Domain Status was not overwritten with 'error'",
+            all(w.get("Domain Status") != "error" for w in row.writes),
+            f"writes: {row.writes!r}")
+
+
+def check_unresolved_order_recovers_when_the_domain_appears(r: Results) -> None:
+    """A NonRealTimeDomain registration completes asynchronously: Registered
+    came back false, and the domain shows up in the account shortly after."""
+    print("\nunresolved: the domain appears in the account, so it resolves itself")
+    row = FakeRow()
+    out, ordered = _domain_stage(
+        row, _OWNED,
+        register=lambda d: {"registered": False, "charged": "8.88", "order_id": "o9"})
+    r.check("the stage ends up registered", out.get("status") == "registered", f"{out!r}")
+    r.check("on the domain the account holds",
+            out.get("domain") == "tamu-traders.online", f"{out!r}")
+    r.check("exactly one order was issued", len(ordered) == 1, f"{ordered!r}")
+    r.check("the claim is resolved", not row.claim_held, f"{row.row!r}")
+
+
+def check_unresolved_without_the_domain_still_stops(r: Results) -> None:
+    print("\nunresolved: still nothing in the account, so it still stops")
+    row = FakeRow()
+    out, ordered = _domain_stage(
+        row, _EMPTY,
+        register=lambda d: {"registered": False, "charged": "8.88", "order_id": "o9"})
+    r.check("the stage reports unresolved", out.get("status") == "unresolved", f"{out!r}")
+    r.check("the claim is kept", row.claim_held, f"{row.row!r}")
+    r.check("the amount is still recorded",
+            any(w.get("Domain Cost") for w in row.writes), f"{row.writes!r}")
+
+
+def check_another_companys_domain_is_never_claimed(r: Results) -> None:
+    """Two companies with similar names generate overlapping candidates.
+
+    Found by the end-to-end run, not by reasoning: a refused order for one
+    company was "resolved" with the domain the previous company had bought
+    seconds earlier, because both generate the same candidate labels. That
+    would record one company's domain against another, on the money path.
+    """
+    print("\nclaim: a domain another company already holds is never taken")
+    row = FakeRow(status=db.DOMAIN_CLAIM)
+    if True:
+        out, ordered = _domain_stage(row, _OWNED, rows=[
+            {"Company Number": "99999999", "Domain": "tamu-traders.online"},
+            {"Company Number": "14123456", "Domain": ""},
+        ])
+        r.check("the other company's domain is not claimed",
+                out.get("domain") != "tamu-traders.online", f"{out!r}")
+        r.check("the stage does not report success",
+                out.get("status") != "registered", f"{out!r}")
+        r.check("no order was issued either", ordered == [], f"{ordered!r}")
+        r.check("the claim is still held", row.claim_held, f"{row.row!r}")
+
+
+def check_ambiguous_account_is_not_guessed(r: Results) -> None:
+    print("\nclaim: two possible domains and no way to tell is UNKNOWN")
+    row = FakeRow(status=db.DOMAIN_CLAIM)
+    if True:
+        listing = {"domains": [{"name": "tamu-traders.online"},
+                               {"name": "tamutraders.online"}], "complete": True}
+        out, ordered = _domain_stage(row, listing)
+        r.check("nothing is guessed", out.get("status") != "registered", f"{out!r}")
+        r.check("both candidates are named for the operator",
+                "tamu-traders.online" in str(out.get("error"))
+                and "tamutraders.online" in str(out.get("error")), f"{out!r}")
+        r.check("the claim is still held", row.claim_held, f"{row.row!r}")
+
+
+class _PagedHTTP:
+    """A provider that serves the account listing in pages."""
+
+    def __init__(self, names: list[str], honour_page: bool = True,
+                 error: bool = False):
+        self.names, self.honour_page, self.error = names, honour_page, error
+        self.pages_asked: list[str] = []
+
+    def _resp(self, url, params=None, data=None, timeout=None, **kw):
+        p = params or data or {}
+        self.pages_asked.append(p.get("Page", "?"))
+        if self.error:
+            body = (f'<ApiResponse Status="ERROR" xmlns="{NSU}"><Errors>'
+                    f'<Error Number="5019169">Unknown exceptions while '
+                    f'retrieving Domain list</Error></Errors></ApiResponse>')
+        else:
+            page = int(p.get("Page", "1")) if self.honour_page else 1
+            chunk = self.names[(page - 1) * 100: page * 100]
+            nodes = "".join(f'<Domain ID="{i}" Name="{n}" />'
+                            for i, n in enumerate(chunk, 1))
+            body = (f'<ApiResponse Status="OK" xmlns="{NSU}"><CommandResponse>'
+                    f'<DomainGetListResult>{nodes}</DomainGetListResult>'
+                    f'</CommandResponse></ApiResponse>')
+
+        class R:
+            text = body
+            status_code = 200
+
+            @staticmethod
+            def raise_for_status():
+                return None
+        return R()
+
+    get = _resp
+    post = _resp
+
+
+def _list_with(http):
+    saved = nc.requests
+    try:
+        nc.requests = http
+        return nc.list_account_domains()
+    finally:
+        nc.requests = saved
+
+
+def check_account_listing_completeness(r: Results) -> None:
+    """`complete` is what the whole safety argument rests on.
+
+    "This domain is not in the account" is the answer that lets the pipeline
+    buy one, so it may only be given when the account was actually read whole.
+    """
+    print("\naccount listing: complete means complete")
+
+    short = _list_with(_PagedHTTP([f"d{i}.online" for i in range(5)]))
+    r.check("a short account reads complete", short.get("complete") is True,
+            f"{short!r}")
+    r.check("...and holds every domain", len(short.get("domains", [])) == 5,
+            f"{short!r}")
+
+    http = _PagedHTTP([f"d{i}.online" for i in range(250)])
+    many = _list_with(http)
+    r.check("a long account is paged to the end", many.get("complete") is True,
+            f"complete={many.get('complete')} after pages {http.pages_asked}")
+    r.check("...and holds all 250", len(many.get("domains", [])) == 250,
+            f"{len(many.get('domains', []))} domains")
+
+    ignored = _list_with(_PagedHTTP([f"d{i}.online" for i in range(250)],
+                                    honour_page=False))
+    r.check("a provider that ignores paging reads INCOMPLETE",
+            ignored.get("complete") is False,
+            f"complete={ignored.get('complete')!r} - treating this as complete "
+            f"would let a domain be bought twice")
+
+    broken = _list_with(_PagedHTTP([], error=True))
+    r.check("an error is an error, not an empty account", "error" in broken,
+            f"{broken!r}")
+    r.check("...carrying the provider's number", "5019169" in str(broken),
+            f"{broken!r}")
+
+
+def check_success_path_unchanged(r: Results) -> None:
+    print("\nsuccess: the ordinary path is untouched")
+    row = FakeRow()
+    out, ordered = _domain_stage(row, _EMPTY)
+    r.check("registered", out.get("status") == "registered", f"{out!r}")
+    r.check("one order", len(ordered) == 1, f"{ordered!r}")
+    r.check("the row records the purchase",
+            any(w.get("Domain Status") == "registered" for w in row.writes),
+            f"{row.writes!r}")
+    r.check("no reconciliation was needed on the happy path",
+            out.get("reconciled") is not True, f"{out!r}")
+
+
 def main() -> int:
     print("test_auto_recovery.py — stages that recover without a human")
     print(f"  + {os.path.join(REPO, 'run_pipeline.py')} (download_certificate paging)")
@@ -468,6 +781,17 @@ def main() -> int:
     check_error_number_survives_parsing(r)
     check_register_domain_surfaces_the_number(r)
     check_operator_sees_the_number(r)
+    check_outstanding_claim_resolves_itself(r)
+    check_outstanding_claim_without_a_domain_stops(r)
+    check_truncated_listing_is_not_proof(r)
+    check_failed_listing_is_not_proof(r)
+    check_refusal_keeps_the_claim(r)
+    check_unresolved_order_recovers_when_the_domain_appears(r)
+    check_unresolved_without_the_domain_still_stops(r)
+    check_another_companys_domain_is_never_claimed(r)
+    check_ambiguous_account_is_not_guessed(r)
+    check_account_listing_completeness(r)
+    check_success_path_unchanged(r)
     return r.report()
 
 

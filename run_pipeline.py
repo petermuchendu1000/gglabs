@@ -641,6 +641,94 @@ def _safe_folder_name(company_name):
     return name or 'unknown'
 
 
+def reconcile_domain_claim(cn, company_name, attempted=""):
+    """Ask the registrar what happened, instead of asking a person.
+
+    An outstanding purchase claim means a domain MAY have been bought and its
+    outcome lost. Namecheap is the only authority on that, and it answers in
+    one call - so the pipeline asks it before it asks anyone, and a company
+    stuck behind a claim unsticks itself on the next run.
+
+    Returns:
+      {"status": "recovered", "domain": d}  the account holds a domain this
+                                            company would have bought, so the
+                                            purchase went through and only the
+                                            record of it was lost
+      {"status": "not_found"}               the WHOLE account was read and
+                                            holds none of them
+      {"status": "unknown", "error": ...}   the account could not be read in
+                                            full - which is a different answer
+                                            and must never be treated as
+                                            "not_found", because that is the
+                                            one that lets a second domain be
+                                            bought
+    """
+    from namecheap_automation import (CHEAP_TLDS, _domain_bases,
+                                      list_account_domains)
+
+    listing = list_account_domains()
+    if "error" in listing:
+        return {"status": "unknown",
+                "error": f"the Namecheap account could not be read: "
+                         f"{listing['error']}"}
+
+    owned = {str(d.get("name") or "").lower() for d in listing.get("domains", [])}
+    wanted = {f"{b}{tld}".lower()
+              for b in _domain_bases(company_name) for tld in CHEAP_TLDS}
+    if attempted:
+        wanted.add(str(attempted).lower())
+
+    # Two companies with similar names generate overlapping candidates, so a
+    # domain another company already holds must never be attributed to this
+    # one. Caught by the end-to-end run: a refused order was "resolved" with
+    # the domain the PREVIOUS company had just bought, which would have
+    # recorded one company's domain against another on the money path.
+    # Deliberately uncached: this decides whether a purchase is attributed.
+    try:
+        taken = {str(r.get("Domain") or "").strip().lower()
+                 for r in db.all_rows(use_cache=False)
+                 if str(r.get("Company Number") or "").strip().lstrip("0")
+                 != str(cn).strip().lstrip("0")}
+    except Exception as e:
+        return {"status": "unknown",
+                "error": f"could not read which domains other companies already "
+                         f"hold, so this one cannot be attributed safely: {e}"}
+    taken.discard("")
+
+    hit = sorted((owned & wanted) - taken)
+    if attempted:
+        # The attempted domain is the strongest evidence there is: it is the
+        # exact name this company's order was for.
+        a = str(attempted).lower()
+        hit = [a] if (a in owned and a not in taken) else [h for h in hit if h != a]
+    if len(hit) > 1:
+        return {"status": "unknown",
+                "error": (f"the account holds {len(hit)} domains this company "
+                          f"could have bought ({', '.join(hit)}) and none is "
+                          f"recorded against another company, so which one is "
+                          f"this company's cannot be decided from the API")}
+    if hit:
+        domain = hit[0]
+        _money_log.info(
+            "claim RESOLVED by reconciliation cn=%s domain=%s; the account "
+            "holds it, so the purchase completed and only the record of it "
+            "was lost", cn, domain)
+        # Writing the outcome is what releases the claim.
+        db.update_row(cn, {"Domain": domain, "Domain Status": "registered"})
+        return {"status": "recovered", "domain": domain}
+
+    if not listing.get("complete"):
+        return {"status": "unknown",
+                "error": ("the Namecheap account listing came back incomplete, "
+                          "so whether a domain was bought could not be "
+                          "established")}
+
+    _money_log.info(
+        "reconciliation cn=%s: the account holds none of the %d domains this "
+        "company would have bought", cn, len(wanted))
+    return {"status": "not_found"}
+
+
 def register_company_domain(company_name, details):
     """Find cheapest domain and register it for a company."""
     from namecheap_automation import (
@@ -706,14 +794,35 @@ def register_company_domain(company_name, details):
                      "domain with nowhere to record the purchase",
         }
     if not db.claim_domain_purchase(cn):
+        # A claim is outstanding, so a domain MAY already have been bought.
+        # This used to stop dead and wait for a person to reconcile by hand.
+        # Ask the registrar instead: if the domain is sitting in the account,
+        # the purchase went through and only the record of it was lost, and
+        # the company can carry on with no human at all.
+        rec = reconcile_domain_claim(cn, company_name)
+        if rec["status"] == "recovered":
+            return {
+                "status": "registered",
+                "domain": rec["domain"],
+                "charged": "",
+                "domain_id": "",
+                "order_id": "",
+                "reconciled": True,
+                "contacts_source": "recovered from the Namecheap account",
+                "alternatives": [],
+            }
+        detail = rec.get("error") or (
+            "the whole Namecheap account was read and holds no domain this "
+            "company would have bought, so no purchase completed - but an "
+            "order that was refused or is still pending cannot be ruled out "
+            "from the API, which is why the claim is kept")
         return {
             "status": "error",
             "error": f"a domain purchase for {cn} is already outstanding "
-                     f"(domain_status='{db.DOMAIN_CLAIM}'). A domain may "
-                     f"already have been bought and charged without its "
-                     f"outcome being recorded. Reconcile against the "
-                     f"Namecheap account by hand before retrying; retrying "
-                     f"blind risks a second charge.",
+                     f"(domain_status='{db.DOMAIN_CLAIM}') and could not be "
+                     f"resolved automatically: {detail}. Check the Namecheap "
+                     f"account; clearing domain_status by hand is what lets "
+                     f"this company buy again.",
         }
 
     # Logged BEFORE the call, not after: if the process dies mid-order this
@@ -740,14 +849,38 @@ def register_company_domain(company_name, details):
         # asserting that no money moved.
         _money_log.warning(
             "domain order REFUSED cn=%s domain=%s; no order was returned to "
-            "record and the claim is released. Provider error %s. If that "
-            "code is an 'unknown response/exception' one, check the Namecheap "
-            "account before running this company again.",
+            "record and the claim is KEPT, because a refusal does not "
+            "establish that nothing was charged. Provider error %s. "
+            "Reconciling against the account now.",
             cn, domain, reg_result["error"])
-        db.update_row(cn, {"Domain Status": "error"})
+        # The claim is KEPT. It used to be released here by writing
+        # domain_status='error', on the strength of "Namecheap rejected the
+        # order, so nothing was charged" - which Namecheap does not say, and
+        # which its own 3050900 "Unknown response from provider" and 5050900
+        # "Unknown exceptions" contradict. Releasing it let the next run issue
+        # a second billed order for a purchase whose outcome was unknown.
+        #
+        # Keeping it would strand the company, so the registrar is asked
+        # straight away: if the domain is in the account after all, this
+        # resolves itself and nobody is called in.
+        rec = reconcile_domain_claim(cn, company_name, attempted=domain)
+        if rec["status"] == "recovered":
+            return {
+                "status": "registered",
+                "domain": rec["domain"],
+                "charged": "",
+                "domain_id": "",
+                "order_id": "",
+                "reconciled": True,
+                "contacts_source": "recovered from the Namecheap account",
+                "alternatives": [],
+            }
         return {
             "status": "error",
-            "error": f"{reg_result['error']} (attempted domain: {domain})",
+            "error": f"{reg_result['error']} (attempted domain: {domain}). The "
+                     f"purchase claim is KEPT because a refusal does not "
+                     f"establish that nothing was charged; "
+                     f"{rec.get('error') or 'the account holds no domain for this company'}.",
             "attempted_domain": domain,
         }
 
@@ -773,13 +906,30 @@ def register_company_domain(company_name, details):
         _money_log.error(
             "domain order UNRESOLVED cn=%s domain=%s charged=%s order=%s; "
             "Namecheap reported Registered=false, claim KEPT to prevent a "
-            "second charge - reconcile by hand",
+            "second charge - reconciling against the account now",
             cn, domain, charged or "unknown",
             reg_result.get("order_id") or "unknown")
         if charged:
             # Record the amount WITHOUT touching domain_status, so the claim
             # survives while the operator has the figure to reconcile with.
             db.update_row(cn, {"Domain Cost": charged})
+        # A NonRealTimeDomain registration completes asynchronously, so
+        # Registered=false can simply mean "not yet". Ask the account: if the
+        # domain is already there, this resolves itself; if not, the next run
+        # asks again, and the company unsticks itself without a person the
+        # moment the registry catches up.
+        rec = reconcile_domain_claim(cn, company_name, attempted=domain)
+        if rec["status"] == "recovered":
+            return {
+                "status": "registered",
+                "domain": rec["domain"],
+                "charged": charged,
+                "domain_id": "",
+                "order_id": reg_result.get("order_id", ""),
+                "reconciled": True,
+                "contacts_source": "recovered from the Namecheap account",
+                "alternatives": [],
+            }
         return {
             "status": "unresolved",
             "error": (
@@ -787,8 +937,10 @@ def register_company_domain(company_name, details):
                 f"Registered=false (charged: {charged or 'unknown'}, order: "
                 f"{reg_result.get('order_id') or 'unknown'}). The domain may "
                 f"be pending rather than failed, so the purchase claim is "
-                f"kept to prevent a second charge. Reconcile against the "
-                f"Namecheap account, then clear domain_status by hand."
+                f"kept to prevent a second charge. The account was checked "
+                f"automatically just now and does not hold it yet; running "
+                f"this stage again will check again, and will finish the "
+                f"company by itself once the registry catches up."
             ),
             "attempted_domain": domain,
             "charged": charged,

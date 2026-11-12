@@ -123,7 +123,7 @@ async function runStage(page, cn, stage, expect, timeout = 120000) {
     // document that every Status=ERROR leaves nothing charged, so the line
     // records what is known and names the provider's error number.
     results['domain refused shows the reason'] =
-      r.drawer.includes('REFUSED') && r.drawer.includes('claim is released')
+      r.drawer.includes('REFUSED') && r.drawer.includes('claim is KEPT')
       && r.drawer.includes('3050900');
     results['domain refused offers an Error Log button'] =
       (await page.locator("#srow-domain button:has-text('Error Log')").count()) > 0;
@@ -170,6 +170,19 @@ async function runStage(page, cn, stage, expect, timeout = 120000) {
     results['run-all never reached the billed domain stage'] = rows.domain.includes('Pending');
     results['run-all never reached the stages after it'] = rows.email.includes('Pending');
     await shot(page, '07-runall-stopped.png');
+
+    say('9. a kept claim unsticks itself when the domain turns up in the account');
+    setMode('unresolved');
+    await addCompany(page, '14123461');
+    await selectCompany(page, '14123461');
+    r = await runStage(page, '14123461', 'domain', 'Failed');
+    results['stuck claim: the first run fails and keeps the claim'] = r.status.includes('Failed');
+    setMode('lands');                       // the registry catches up
+    r = await runStage(page, '14123461', 'domain', 'Done');
+    results['stuck claim: the re-run finishes it with NO human'] = r.status.includes('Done');
+    results['stuck claim: resolved by reconciliation, not by a second order'] =
+      r.drawer.includes('RESOLVED by reconciliation');
+    await shot(page, '09-claim-self-healed.png');
 
     say('8. the drawer for a stage that never ran');
     await page.evaluate(() => openLog('app'));

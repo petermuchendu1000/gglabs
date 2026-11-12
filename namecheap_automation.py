@@ -722,6 +722,49 @@ def get_domain_list():
     return {"domains": domains, "count": len(domains)}
 
 
+def list_account_domains(max_pages=20):
+    """Every domain in THIS account, with an explicit completeness flag.
+
+    Returns {"domains": [{"name": ...}], "complete": bool}, or {"error": ...}.
+
+    `complete` matters more than the list does. "This domain is not in the
+    account" is the answer that lets the pipeline go on and buy one, so it may
+    only be given when the whole account was actually read. A failed call, a
+    listing that hit the page cap, or a page that repeats because the provider
+    did not honour our paging all come back complete=False, and the caller
+    must then treat a miss as UNKNOWN rather than as "not ours".
+
+    That distinction is the one pipeline.py:180 records for this same call:
+    an error response carries no Domain elements, so an unchecked failure
+    reads exactly like an account with nothing in it.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    complete = False
+    for page in range(1, max_pages + 1):
+        resp = _api_call("domains.getList", {"PageSize": "100", "Page": str(page)})
+        if resp["status"] != "OK":
+            return {"error": f"Failed: {resp['errors']}",
+                    "error_numbers": resp.get("error_numbers", [])}
+        page_names = [n.attrib.get("Name", "") for n in resp["root"].iter()
+                      if "Domain" in _node_name(n) and n.attrib.get("Name")]
+        if not page_names:
+            complete = True
+            break
+        fresh = [n for n in page_names if n.lower() not in seen]
+        if not fresh:
+            # The same page came back twice, so Page is not being honoured and
+            # the rest of the account was never read. Not complete.
+            break
+        for n in fresh:
+            seen.add(n.lower())
+            names.append(n)
+        if len(page_names) < 100:
+            complete = True
+            break
+    return {"domains": [{"name": n} for n in names], "complete": complete}
+
+
 def get_pricing(tld="com"):
     """Get registration pricing for a specific TLD."""
     resp = _api_call("users.getPricing", {

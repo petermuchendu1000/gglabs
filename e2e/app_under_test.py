@@ -54,8 +54,26 @@ def mode() -> str:
 NSU = "http://api.namecheap.com/xml.response"
 
 
+# Domains this fake account holds. A successful create puts one here, which
+# is what lets the reconciliation path be exercised honestly.
+_ACCOUNT: set = set()
+_LAST_ATTEMPT = {"domain": ""}
+
+
 def _namecheap_xml(command: str, p: dict) -> str:
     cmd = (command or "").replace("namecheap.", "")
+    if cmd == "domains.getList":
+        held = set(_ACCOUNT)
+        if mode() == "lands" and _LAST_ATTEMPT["domain"]:
+            # The registry caught up: the domain the unresolved order was for
+            # is now in the account.
+            held.add(_LAST_ATTEMPT["domain"])
+        nodes = "".join(f'<Domain ID="{i}" Name="{n}" />'
+                        for i, n in enumerate(sorted(held), start=1))
+        return (f'<?xml version="1.0" encoding="utf-8"?>'
+                f'<ApiResponse Status="OK" xmlns="{NSU}"><CommandResponse>'
+                f'<DomainGetListResult>{nodes}</DomainGetListResult>'
+                f'</CommandResponse></ApiResponse>')
     if cmd == "domains.check":
         first = (p.get("DomainList", "") or "x.online").split(",")[0]
         return (f'<?xml version="1.0" encoding="utf-8"?>'
@@ -75,8 +93,11 @@ def _namecheap_xml(command: str, p: dict) -> str:
                     f'<ApiResponse Status="ERROR" xmlns="{NSU}"><Errors>'
                     f'<Error Number="3050900">Unknown response from provider</Error>'
                     f'</Errors></ApiResponse>')
-        registered = "false" if m == "unresolved" else "true"
-        order = "o9" if m == "unresolved" else "o1"
+        _LAST_ATTEMPT["domain"] = dom
+        registered = "false" if m in ("unresolved", "lands") else "true"
+        order = "o9" if m in ("unresolved", "lands") else "o1"
+        if registered == "true":
+            _ACCOUNT.add(dom)
         return (f'<?xml version="1.0" encoding="utf-8"?>'
                 f'<ApiResponse Status="OK" xmlns="{NSU}"><CommandResponse>'
                 f'<DomainCreateResult Domain="{dom}" Registered="{registered}" '
@@ -119,13 +140,21 @@ OFFICERS = {"items": [
      "officer_role": "director", "appointed_on": "2021-03-02",
      "date_of_birth": {"month": 7, "year": 1979}, "resigned_on": None},
 ]}
-PROFILE = {
-    "company_name": "TAMU TRADERS LTD", "company_number": "14123456",
-    "company_status": "active", "type": "ltd", "date_of_creation": "2021-03-01",
-    "sic_codes": ["6201"],
-    "registered_office_address": {"address_line_1": "1 Example Street",
-                                  "locality": "London", "postal_code": "EC1A 1BB"},
-}
+def _company_name(cn: str) -> str:
+    # Distinct per company: two companies with the same name would generate
+    # the same candidate domains, which is a real case but not the default one.
+    return f"TAMU TRADERS {str(cn)[-2:]} LTD"
+
+
+def _profile(cn: str) -> dict:
+    return {
+        "company_name": _company_name(cn), "company_number": str(cn),
+        "company_status": "active", "type": "ltd",
+        "date_of_creation": "2021-03-01", "sic_codes": ["6201"],
+        "registered_office_address": {"address_line_1": "1 Example Street",
+                                      "locality": "London",
+                                      "postal_code": "EC1A 1BB"},
+    }
 
 
 class _FakeResp:
@@ -143,7 +172,7 @@ class _FakeSession:
     def get(self, url, **kw):
         if "/officers" in url:
             return _FakeResp(OFFICERS)
-        return _FakeResp(PROFILE)
+        return _FakeResp(_profile(url.rstrip("/").rsplit("/", 1)[-1]))
 
 
 def fake_ch_get(path, params=None):
@@ -153,10 +182,12 @@ def fake_ch_get(path, params=None):
         # the real Kenyan-director admission check runs on it.
         q = path.split("q=", 1)[1].split("&", 1)[0] if "q=" in path else "14123456"
         return {"total_results": 1, "items": [{
-            "company_number": q, "title": "TAMU TRADERS LTD",
+            "company_number": q, "title": _company_name(q),
             "company_status": "active", "date_of_creation": "2021-03-01"}]}
     if "/officers" in path:
         return OFFICERS
+    if path.startswith("/company/") and "/" not in path[len("/company/"):]:
+        return _profile(path.rsplit("/", 1)[-1])
     if "/filing-history" in path:
         if mode() == "nocert":
             return {"items": [{"category": "accounts", "description": "accounts",
@@ -164,7 +195,7 @@ def fake_ch_get(path, params=None):
         return {"items": [{"category": "incorporation", "description": "incorporation",
                            "type": "NEWINC",
                            "links": {"document_metadata": "/document/abc"}}]}
-    return PROFILE
+    return _profile('14123456')
 
 
 class _FakePdf:
