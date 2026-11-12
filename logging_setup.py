@@ -9,6 +9,15 @@ Structured application logs go to STDERR, deliberately:
   - gunicorn is configured with errorlog = "-" (gunicorn.conf.py), so stderr
     is what the host captures.
 
+The ONE exception is the `money` logger, which goes to stderr AND to stdout.
+Its lines are the only narration the domain stage has: register_company_domain
+(run_pipeline.py:644) and the whole Namecheap client contain no print() at
+all, so with stderr as their only sink a stage that bought a domain, one that
+was refused, and one whose order was left UNRESOLVED all produced an empty job
+log, and the dashboard showed "Waiting for output…" for every one of them.
+Mirroring this one channel to stdout puts those lines in the job log without
+putting ordinary application logging there.
+
 Call configure_logging() from every entry point: app.py for the web app, and
 run_pipeline.py's __main__ for the subprocess the dashboard launches via
 wizard_routes._resolve_pipeline_script.
@@ -51,6 +60,30 @@ class _RequestIdFilter(logging.Filter):
         return True
 
 
+class _CurrentStdoutHandler(logging.Handler):
+    """Write a record to whatever sys.stdout is AT EMIT TIME.
+
+    Not logging.StreamHandler, which keeps the stream object it was
+    constructed with. api_v2 replaces sys.stdout with its per-job _Tee when it
+    is imported (app.py:108), and configure_logging() runs before that
+    (app.py:25) - so a StreamHandler built here would hold the real stdout and
+    never reach the buffer the dashboard polls. Measured, not assumed: a
+    handler constructed with the pre-swap sys.stdout does not follow the swap;
+    one that resolves sys.stdout per record does.
+
+    Resolving per record is also what makes this correct under concurrency.
+    _Tee routes a write to the buffer bound by the CALLING thread, so a money
+    line logged inside a stage worker lands in that stage's log and in no
+    other, and one shared handler cannot double-write.
+    """
+
+    def emit(self, record):
+        try:
+            sys.stdout.write(self.format(record) + "\n")
+        except Exception:
+            self.handleError(record)
+
+
 def configure_logging() -> logging.Logger:
     """Install a stderr handler on the root logger, exactly once.
 
@@ -78,6 +111,20 @@ def configure_logging() -> logging.Logger:
     root = logging.getLogger()
     root.setLevel(level)
     root.addHandler(handler)
+
+    # The money channel additionally goes to stdout, so the per-stage job log
+    # is not empty for the stages that spend money. This is an ADDITIONAL
+    # sink, not a move: propagation to the root handler above is what keeps
+    # the audit trail on stderr, where gunicorn captures it.
+    #
+    # Deliberately attached once, to the logger rather than around a stage:
+    # attaching per stage run would give two handlers while two stages ran,
+    # and each record would then be written twice into the logging thread's
+    # own job buffer.
+    money = logging.getLogger("money")
+    money_stdout = _CurrentStdoutHandler()
+    money_stdout.setFormatter(logging.Formatter("%(levelname)-7s [%(name)s] %(message)s"))
+    money.addHandler(money_stdout)
 
     _CONFIGURED = True
     return root

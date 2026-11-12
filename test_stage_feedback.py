@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""Tests for stage feedback: what the dashboard is told when a stage runs.
+
+    python3 test_stage_feedback.py
+
+Hermetic: no network, no Namecheap account, no database. The stage function
+itself is stubbed, because what is under test is the job runner and the log
+plumbing around it, not any one stage.
+
+Three failures this pins, all of them "the stage ran and said nothing":
+
+  * The domain stage writes NOTHING to stdout. Every line it has to say goes
+    through the `money` logger, and logging_setup sends log records to stderr
+    on purpose, while the dashboard's per-stage log is a capture of stdout
+    (api_v2._Tee). Measured on the unfixed code: a rejected domain order
+    produced 0 bytes of job log and two stderr lines nobody reading the
+    dashboard can see.
+
+  * api_v2._spawn marked a job "done" whenever the stage function returned
+    without raising. register_company_domain reports a rejected order as
+    {"status": "error"} and an order whose outcome is UNKNOWN as
+    {"status": "unresolved"} (run_pipeline.py:738, :773), and get_duns_number
+    reports an exhausted retry the same way (run_pipeline.py:599). So a
+    domain that was never bought - or was charged and left unresolved - got a
+    green tick, no error, and no Error Log button, while the explanation sat
+    unread in the job's `result` field.
+
+  * /run-all did not stop on such a failure either, so it walked on to the
+    next stage as though the previous one had succeeded.
+
+The money-critical case is "unresolved": the purchase claim is deliberately
+KEPT, a charge may have happened, and a human has to reconcile. That is the
+one outcome that must never render as success.
+"""
+import io
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, REPO)
+
+from logging_setup import configure_logging
+
+configure_logging()
+
+import api_v2
+
+
+class Results:
+    def __init__(self) -> None:
+        self.passed = 0
+        self.failed: list[str] = []
+        self.skipped: list[str] = []
+
+    def check(self, name: str, cond: bool, detail: str = "") -> bool:
+        if cond:
+            self.passed += 1
+            print(f"  PASS  {name}")
+        else:
+            self.failed.append(name)
+            print(f"  FAIL  {name}" + (f"\n          {detail}" if detail else ""))
+        return bool(cond)
+
+    def skip(self, name: str, why: str) -> None:
+        self.skipped.append(name)
+        print(f"  SKIP  {name}\n          {why}")
+
+    def report(self) -> int:
+        print()
+        print(f"{self.passed} passed / {len(self.failed)} failed / "
+              f"{len(self.skipped)} skipped")
+        for f in self.failed:
+            print(f"  failed: {f}")
+        for s in self.skipped:
+            print(f"  skipped: {s}")
+        return 1 if self.failed else 0
+
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+def _run_spawn(cn: str, stage: str, fn, timeout: float = 5.0) -> dict:
+    """Run fn through api_v2._spawn and return the finished job dict."""
+    api_v2._spawn(cn, stage, fn)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        j = api_v2._job_get(cn, stage)
+        if j.get("status") in ("done", "failed"):
+            return j
+        time.sleep(0.02)
+    return api_v2._job_get(cn, stage)
+
+
+def _money_line_in_job_log(cn: str, stage: str, message: str) -> str:
+    """Emit one money-logger record inside a bound worker thread.
+
+    This is exactly the shape of the real thing: register_company_domain logs
+    to the `money` logger from inside the thread api_v2._spawn bound.
+    """
+    key = api_v2._jk(cn, stage)
+    captured: dict[str, str] = {}
+
+    def worker():
+        api_v2._TEE.bind(key)
+        logging.getLogger("money").info("%s", message)
+        captured["log"] = api_v2._TEE.unbind()
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(5)
+    return captured.get("log", "")
+
+
+# ── the money log has to reach the job log ──────────────────────────────────
+
+def check_money_log_reaches_job_log(r: Results) -> None:
+    print("\nmoney log -> per-stage job log")
+    log = _money_line_in_job_log("00000001", "domain", "MONEYPROBE order issued")
+    r.check("a money-logger line reaches the bound job's log buffer",
+            "MONEYPROBE order issued" in log,
+            f"job log was {log!r}. The domain stage says everything it has to "
+            f"say through this logger; if the line does not land here, the "
+            f"dashboard's log drawer is empty for the one stage that spends "
+            f"money.")
+
+
+def check_money_log_still_on_stderr(r: Results) -> None:
+    """The audit trail must not MOVE to stdout - it must also stay on stderr.
+
+    logging_setup documents `money` as the one channel that should never be
+    filtered out, and gunicorn captures stderr (errorlog = "-").
+    """
+    print("\nmoney log -> stderr (audit trail preserved)")
+    root = logging.getLogger()
+    stderr_handlers = [h for h in root.handlers
+                       if isinstance(h, logging.StreamHandler)
+                       and getattr(h, "stream", None) is sys.stderr]
+    r.check("the root logger still has a stderr handler",
+            bool(stderr_handlers),
+            f"root handlers: {root.handlers!r}")
+    money = logging.getLogger("money")
+    r.check("the money logger still propagates to it",
+            money.propagate is True,
+            "propagate=False would take the money lines off stderr, which is "
+            "where the audit trail is read from")
+
+
+def check_money_log_does_not_cross_jobs(r: Results) -> None:
+    """Two stages running at once must not see each other's money lines.
+
+    _Tee routes by the WRITING thread, so one shared handler is correct here;
+    a per-stage handler would double-write. This pins the property either way.
+    """
+    print("\nmoney log -> isolated per job")
+    out: dict[str, str] = {}
+    barrier = threading.Barrier(2)
+
+    def worker(tag: str):
+        key = api_v2._jk("0000000" + tag, "domain")
+        api_v2._TEE.bind(key)
+        barrier.wait(5)
+        logging.getLogger("money").info("MONEYPROBE tag=%s", tag)
+        time.sleep(0.05)
+        out[tag] = api_v2._TEE.unbind()
+
+    ts = [threading.Thread(target=worker, args=(t,)) for t in ("2", "3")]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(5)
+
+    r.check("job 2 saw its own money line", "tag=2" in out.get("2", ""),
+            f"job 2 log: {out.get('2')!r}")
+    r.check("job 2 did NOT see job 3's money line", "tag=3" not in out.get("2", ""),
+            f"job 2 log: {out.get('2')!r}")
+    r.check("job 3 did NOT see job 2's money line", "tag=2" not in out.get("3", ""),
+            f"job 3 log: {out.get('3')!r}")
+
+
+# ── a stage that fails by RETURNING must not read as success ────────────────
+
+def check_returned_error_marks_failed(r: Results) -> None:
+    print("\nreturned status=error -> job failed")
+    j = _run_spawn("00000010", "domain",
+                   lambda: {"status": "error",
+                            "error": "Namecheap rejected the order "
+                                     "(attempted domain: example.online)"})
+    r.check("job status is failed", j.get("status") == "failed",
+            f"status was {j.get('status')!r}; 'done' is a green tick for a "
+            f"domain that was never bought")
+    r.check("the returned error is carried on the job",
+            "Namecheap rejected the order" in str(j.get("error") or ""),
+            f"error was {j.get('error')!r}")
+    r.check("the returned dict is still kept in result",
+            "example.online" in str(j.get("result") or ""),
+            f"result was {j.get('result')!r}")
+
+
+def check_returned_unresolved_marks_failed(r: Results) -> None:
+    print("\nreturned status=unresolved -> job failed (money-critical)")
+    j = _run_spawn("00000011", "domain",
+                   lambda: {"status": "unresolved",
+                            "error": "Namecheap accepted the order but "
+                                     "reported Registered=false",
+                            "charged": "9.86"})
+    r.check("job status is failed", j.get("status") == "failed",
+            f"status was {j.get('status')!r}. This is the outcome where a "
+            f"charge MAY have happened and the purchase claim is kept on "
+            f"purpose; rendering it as success is how a human never finds out")
+    r.check("the operator is told why",
+            "Registered=false" in str(j.get("error") or ""),
+            f"error was {j.get('error')!r}")
+
+
+def check_success_statuses_still_done(r: Results) -> None:
+    """Scope guard, not a defect test.
+
+    This passes on the unfixed code too. It is here so the status check cannot
+    quietly start failing stages that did their job: `certificate` returns an
+    "error" KEY that is None on success, `duns` reports a legitimate
+    "not_found", and two stages return a bare {"status": "done"}.
+    """
+    print("\nnon-failure returns stay done (scope guard)")
+    cases = [
+        ("registered domain",   {"status": "registered", "domain": "x.online"}),
+        ("assigned email",      {"status": "assigned", "email": "a@b.c"}),
+        ("already assigned",    {"status": "already_assigned"}),
+        ("duns found",          {"status": "found", "duns_number": "123"}),
+        ("duns not_found",      {"status": "not_found", "duns_number": ""}),
+        ("plain done",          {"status": "done"}),
+        ("certificate ok",      {"path": "/tmp/c.pdf", "error": None}),
+        ("details dict",        {"company_number": "1", "row_updates": {}}),
+        ("non-dict return",     "a string"),
+    ]
+    for i, (label, ret) in enumerate(cases):
+        j = _run_spawn(f"000002{i:02d}", "domain", lambda ret=ret: ret)
+        r.check(f"{label} -> done", j.get("status") == "done",
+                f"status was {j.get('status')!r} for return {ret!r}")
+
+
+def check_raise_still_marks_failed(r: Results) -> None:
+    print("\nraising still marks the job failed (unchanged behaviour)")
+
+    def boom():
+        raise RuntimeError("stage blew up")
+
+    j = _run_spawn("00000030", "domain", boom)
+    r.check("job status is failed", j.get("status") == "failed",
+            f"status was {j.get('status')!r}")
+    r.check("the exception message is on the job",
+            "stage blew up" in str(j.get("error") or ""),
+            f"error was {j.get('error')!r}")
+    r.check("the traceback is in the log",
+            "Traceback" in str(j.get("log") or ""),
+            f"log was {str(j.get('log'))[:200]!r}")
+
+
+# ── run-all must stop when a stage reports failure ─────────────────────────
+
+def check_run_all_stops_on_reported_failure(r: Results) -> None:
+    """Drive the real /run-all route with the stage function stubbed.
+
+    The chain must stop where a stage REPORTS failure, exactly as it already
+    stops where a stage raises. Walking on means the next stage - possibly the
+    billed domain purchase - runs on the strength of a stage that did not
+    succeed.
+    """
+    print("\n/run-all stops on a reported failure")
+    try:
+        from flask import Flask
+    except ModuleNotFoundError as e:
+        r.skip("/run-all stops on a reported failure",
+               f"flask is not installed in this environment ({e})")
+        return
+
+    cn = "00000040"
+    order = api_v2.STAGE_ORDER
+    fail_at = order[1]
+    ran: list[str] = []
+
+    saved = (api_v2._find_row, api_v2._compute_stages, api_v2._exec_stage,
+             api_v2._co_lock)
+    try:
+        api_v2._find_row = lambda _cn: {"Company Number": cn,
+                                        "Company Name": "TEST CO LTD"}
+        api_v2._compute_stages = lambda _cn, _row: {s: False for s in order}
+        api_v2._co_lock = lambda _cn: threading.Lock()
+
+        def fake_exec(_cn, stage, _row):
+            ran.append(stage)
+            if stage == fail_at:
+                return {"status": "error", "error": "reported failure"}
+            return {"status": "done"}
+
+        api_v2._exec_stage = fake_exec
+
+        app = Flask(__name__)
+        app.register_blueprint(api_v2.api_v2)
+        client = app.test_client()
+        resp = client.post(f"/api/v2/company/{cn}/run-all")
+        r.check("the route accepted the request", resp.status_code == 200,
+                f"HTTP {resp.status_code}: {resp.data!r}")
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if api_v2._job_get(cn, fail_at).get("status") in ("done", "failed"):
+                break
+            time.sleep(0.02)
+        time.sleep(0.2)   # give a wrongly-continuing chain time to show itself
+
+        r.check(f"the failing stage ({fail_at}) is marked failed",
+                api_v2._job_get(cn, fail_at).get("status") == "failed",
+                f"job was {api_v2._job_get(cn, fail_at)!r}")
+        r.check(f"the stage before it ({order[0]}) is marked done",
+                api_v2._job_get(cn, order[0]).get("status") == "done",
+                f"job was {api_v2._job_get(cn, order[0])!r}")
+        r.check("no stage after the failure ran",
+                ran == [order[0], fail_at],
+                f"stages that ran: {ran!r}; expected to stop after {fail_at!r}")
+        for later in order[2:]:
+            r.check(f"{later} never started",
+                    api_v2._job_get(cn, later).get("status") in (None, "", "idle"),
+                    f"job was {api_v2._job_get(cn, later)!r}")
+    finally:
+        (api_v2._find_row, api_v2._compute_stages, api_v2._exec_stage,
+         api_v2._co_lock) = saved
+
+
+# ── the drawer has to show something ───────────────────────────────────────
+
+_DRAWER_CASES = [
+    # (label, job, must appear in the rendered text)
+    ("a real log wins",            {"status": "done", "log": "line one"}, "line one"),
+    ("failed with empty log",      {"status": "failed", "log": "",
+                                    "error": "Namecheap rejected the order"},
+                                   "Namecheap rejected the order"),
+    ("done with empty log",        {"status": "done", "log": "",
+                                    "result": "{'status': 'registered'}"},
+                                   "registered"),
+    ("running with nothing yet",   {"status": "running", "log": ""},
+                                   "Waiting for output"),
+    ("idle",                       {"status": "idle"}, "No output yet."),
+    ("no job at all",              {}, "No output yet."),
+]
+
+
+def _extract_js_function(src: str, name: str) -> str | None:
+    """Pull one top-level `function name(...) { ... }` out of the page."""
+    m = re.search(r"^function\s+" + re.escape(name) + r"\s*\(", src, re.M)
+    if not m:
+        return None
+    i = src.index("{", m.end() - 1)
+    depth = 0
+    for j in range(i, len(src)):
+        if src[j] == "{":
+            depth += 1
+        elif src[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[m.start():j + 1]
+    return None
+
+
+def check_drawer_text(r: Results) -> None:
+    """Run the SHIPPED drawer function in node against real job shapes."""
+    print("\nlog drawer text (static/app.html, run in node)")
+    page = os.path.join(REPO, "static", "app.html")
+    with open(page, encoding="utf-8") as f:
+        src = f.read()
+
+    fn = _extract_js_function(src, "drawerText")
+    if not r.check("static/app.html defines drawerText(j)", fn is not None,
+                   "the drawer's text choice has to be a named function for "
+                   "this test to reach it; without it the fallback is inline "
+                   "in refreshLogContent and only a browser can see it"):
+        return
+
+    r.check("refreshLogContent uses drawerText",
+            re.search(r"drawerText\s*\(\s*j\s*\)", src) is not None,
+            "the function exists but nothing calls it with the job")
+
+    if not shutil_which("node"):
+        r.skip("drawer text cases", "node is not on PATH")
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        driver = os.path.join(td, "drawer_test.mjs")
+        with open(driver, "w", encoding="utf-8") as f:
+            f.write(fn + "\n")
+            f.write("const cases = " + json.dumps(
+                [[lbl, job, want] for lbl, job, want in _DRAWER_CASES]) + ";\n")
+            f.write("""
+const out = [];
+for (const [label, job, want] of cases) {
+  let text, err = null;
+  try { text = String(drawerText(job)); }
+  catch (e) { text = ""; err = String(e); }
+  out.push({label, text, ok: text.includes(want), err});
+}
+console.log(JSON.stringify(out));
+""")
+        proc = subprocess.run([shutil_which("node"), driver],
+                              capture_output=True, text=True, timeout=60)
+        if not r.check("node ran the extracted function", proc.returncode == 0,
+                       f"exit {proc.returncode}: {proc.stderr.strip()[:400]}"):
+            return
+        results = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    for (lbl, job, want), got in zip(_DRAWER_CASES, results):
+        r.check(f"drawer: {lbl}", got["ok"],
+                f"job {job!r} rendered {got['text']!r}, expected it to contain "
+                f"{want!r}" + (f" (error: {got['err']})" if got["err"] else ""))
+
+
+def shutil_which(cmd: str):
+    import shutil
+    return shutil.which(cmd)
+
+
+# ── main ────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    print("test_stage_feedback.py — what the dashboard is told when a stage runs")
+    print(f"  + {os.path.join(REPO, 'logging_setup.py')}  (money -> stdout)")
+    print(f"  + {os.path.join(REPO, 'api_v2.py')}         (_spawn / _seq status)")
+    print(f"  + {os.path.join(REPO, 'static', 'app.html')} (drawerText)")
+    r = Results()
+    check_money_log_reaches_job_log(r)
+    check_money_log_still_on_stderr(r)
+    check_money_log_does_not_cross_jobs(r)
+    check_returned_error_marks_failed(r)
+    check_returned_unresolved_marks_failed(r)
+    check_success_statuses_still_done(r)
+    check_raise_still_marks_failed(r)
+    check_run_all_stops_on_reported_failure(r)
+    check_drawer_text(r)
+    return r.report()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

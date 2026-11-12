@@ -154,6 +154,34 @@ _TEE = _Tee()
 sys.stdout = _TEE
 
 
+# A stage can fail by RETURNING a status instead of raising, and the money
+# path does exactly that on purpose. register_company_domain reports a refused
+# order as {"status": "error"} (run_pipeline.py:738) and an order whose outcome
+# is UNKNOWN - possibly charged, claim deliberately kept - as
+# {"status": "unresolved"} (run_pipeline.py:773); get_duns_number reports an
+# exhausted retry as {"status": "error"} (run_pipeline.py:599).
+#
+# Only exceptions used to mark a job failed, so every one of those was recorded
+# status="done": a green tick and no Error Log button for a domain that was
+# never bought, with the explanation left unread in the job's `result`.
+_FAILED_RESULT_STATUSES = {"error", "unresolved", "failed"}
+
+
+def _result_failure(result) -> str | None:
+    """The error message if a stage reported failure by return value, else None.
+
+    Keyed on the status VALUE, never on the presence of an "error" key:
+    download_certificate returns {"path": ..., "error": None} on success
+    (run_pipeline.py:912), and a success must not read as a failure.
+    """
+    if not isinstance(result, dict):
+        return None
+    if str(result.get("status") or "") not in _FAILED_RESULT_STATUSES:
+        return None
+    return (str(result.get("error") or "")
+            or f"stage reported status={result.get('status')!r} without an error message")
+
+
 def _spawn(cn: str, stage: str, fn) -> None:
     """Run fn() in a daemon thread, tracking job state and capturing stdout."""
     key = _jk(cn, stage)
@@ -165,8 +193,11 @@ def _spawn(cn: str, stage: str, fn) -> None:
         try:
             result = fn()
             log = _TEE.unbind()
-            _job_set(cn, stage, status="done",
+            failure = _result_failure(result)
+            _job_set(cn, stage,
+                     status="failed" if failure else "done",
                      finished_at=datetime.now().isoformat(),
+                     error=failure,
                      log=log, result=str(result)[:500])
         except Exception as e:
             log = _TEE.unbind()
@@ -775,11 +806,20 @@ def v2_run_all(cn):
                          finished_at=None, error=None, log=None)
                 _TEE.bind(key)
                 try:
-                    _exec_stage(cn, stage, _find_row(cn) or fresh)
+                    result = _exec_stage(cn, stage, _find_row(cn) or fresh)
                     log = _TEE.unbind()
-                    _job_set(cn, stage, status="done",
+                    failure = _result_failure(result)
+                    _job_set(cn, stage,
+                             status="failed" if failure else "done",
                              finished_at=datetime.now().isoformat(),
-                             log=log)
+                             error=failure,
+                             log=log, result=str(result)[:500])
+                    if failure:
+                        # Stop for a reported failure exactly as for a raised
+                        # one. Walking on ran the next stages - the billed
+                        # domain purchase among them - on the strength of a
+                        # stage that had not succeeded.
+                        break
                 except Exception as e:
                     log = _TEE.unbind()
                     _job_set(cn, stage, status="failed",
