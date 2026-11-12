@@ -41,6 +41,13 @@ import directors as directors_mod  # officer parsing, shared with api_v2
 # namecheap.domains.create order and its outcome is recorded here, so there
 # is a record of the charge outside the company row itself.
 _money_log = logging.getLogger("money")
+
+# How long an unresolvable purchase claim may stand before it is released so
+# the company can buy again. The operator of this pipeline set it at seven
+# days; it is a policy choice, not a number derived from anything. It only
+# ever applies when the registrar has been read in full and holds no domain
+# for the company - see reconcile_domain_claim and db.release_expired_claim.
+CLAIM_MAX_AGE_DAYS = 7
 try:
     db.ensure_schema()
 except Exception as _e:
@@ -641,6 +648,94 @@ def _safe_folder_name(company_name):
     return name or 'unknown'
 
 
+def reconcile_domain_claim(cn, company_name, attempted=""):
+    """Ask the registrar what happened, instead of asking a person.
+
+    An outstanding purchase claim means a domain MAY have been bought and its
+    outcome lost. Namecheap is the only authority on that, and it answers in
+    one call - so the pipeline asks it before it asks anyone, and a company
+    stuck behind a claim unsticks itself on the next run.
+
+    Returns:
+      {"status": "recovered", "domain": d}  the account holds a domain this
+                                            company would have bought, so the
+                                            purchase went through and only the
+                                            record of it was lost
+      {"status": "not_found"}               the WHOLE account was read and
+                                            holds none of them
+      {"status": "unknown", "error": ...}   the account could not be read in
+                                            full - which is a different answer
+                                            and must never be treated as
+                                            "not_found", because that is the
+                                            one that lets a second domain be
+                                            bought
+    """
+    from namecheap_automation import (CHEAP_TLDS, _domain_bases,
+                                      list_account_domains)
+
+    listing = list_account_domains()
+    if "error" in listing:
+        return {"status": "unknown",
+                "error": f"the Namecheap account could not be read: "
+                         f"{listing['error']}"}
+
+    owned = {str(d.get("name") or "").lower() for d in listing.get("domains", [])}
+    wanted = {f"{b}{tld}".lower()
+              for b in _domain_bases(company_name) for tld in CHEAP_TLDS}
+    if attempted:
+        wanted.add(str(attempted).lower())
+
+    # Two companies with similar names generate overlapping candidates, so a
+    # domain another company already holds must never be attributed to this
+    # one. Caught by the end-to-end run: a refused order was "resolved" with
+    # the domain the PREVIOUS company had just bought, which would have
+    # recorded one company's domain against another on the money path.
+    # Deliberately uncached: this decides whether a purchase is attributed.
+    try:
+        taken = {str(r.get("Domain") or "").strip().lower()
+                 for r in db.all_rows(use_cache=False)
+                 if str(r.get("Company Number") or "").strip().lstrip("0")
+                 != str(cn).strip().lstrip("0")}
+    except Exception as e:
+        return {"status": "unknown",
+                "error": f"could not read which domains other companies already "
+                         f"hold, so this one cannot be attributed safely: {e}"}
+    taken.discard("")
+
+    hit = sorted((owned & wanted) - taken)
+    if attempted:
+        # The attempted domain is the strongest evidence there is: it is the
+        # exact name this company's order was for.
+        a = str(attempted).lower()
+        hit = [a] if (a in owned and a not in taken) else [h for h in hit if h != a]
+    if len(hit) > 1:
+        return {"status": "unknown",
+                "error": (f"the account holds {len(hit)} domains this company "
+                          f"could have bought ({', '.join(hit)}) and none is "
+                          f"recorded against another company, so which one is "
+                          f"this company's cannot be decided from the API")}
+    if hit:
+        domain = hit[0]
+        _money_log.info(
+            "claim RESOLVED by reconciliation cn=%s domain=%s; the account "
+            "holds it, so the purchase completed and only the record of it "
+            "was lost", cn, domain)
+        # Writing the outcome is what releases the claim.
+        db.update_row(cn, {"Domain": domain, "Domain Status": "registered"})
+        return {"status": "recovered", "domain": domain}
+
+    if not listing.get("complete"):
+        return {"status": "unknown",
+                "error": ("the Namecheap account listing came back incomplete, "
+                          "so whether a domain was bought could not be "
+                          "established")}
+
+    _money_log.info(
+        "reconciliation cn=%s: the account holds none of the %d domains this "
+        "company would have bought", cn, len(wanted))
+    return {"status": "not_found"}
+
+
 def register_company_domain(company_name, details):
     """Find cheapest domain and register it for a company."""
     from namecheap_automation import (
@@ -705,16 +800,48 @@ def register_company_domain(company_name, details):
             "error": "company_number missing from details; refusing to buy a "
                      "domain with nowhere to record the purchase",
         }
-    if not db.claim_domain_purchase(cn):
-        return {
-            "status": "error",
-            "error": f"a domain purchase for {cn} is already outstanding "
-                     f"(domain_status='{db.DOMAIN_CLAIM}'). A domain may "
-                     f"already have been bought and charged without its "
-                     f"outcome being recorded. Reconcile against the "
-                     f"Namecheap account by hand before retrying; retrying "
-                     f"blind risks a second charge.",
-        }
+    claimed = db.claim_domain_purchase(cn)
+    if not claimed:
+        # A claim is outstanding, so a domain MAY already have been bought.
+        # This used to stop dead and wait for a person to reconcile by hand.
+        # Ask the registrar instead: if the domain is sitting in the account,
+        # the purchase went through and only the record of it was lost, and
+        # the company can carry on with no human at all.
+        rec = reconcile_domain_claim(cn, company_name)
+        if rec["status"] == "not_found":
+            # The WHOLE account was read and holds nothing for this company.
+            # Only that answer may age out - "unknown" never reaches here,
+            # because it is the one that cannot rule out a purchase.
+            if db.release_expired_claim(cn, CLAIM_MAX_AGE_DAYS):
+                claimed = db.claim_domain_purchase(cn)
+        if rec["status"] == "recovered":
+            return {
+                "status": "registered",
+                "domain": rec["domain"],
+                "charged": "",
+                "domain_id": "",
+                "order_id": "",
+                "reconciled": True,
+                "contacts_source": "recovered from the Namecheap account",
+                "alternatives": [],
+            }
+        if not claimed:
+            detail = rec.get("error") or (
+                f"the whole Namecheap account was read and holds no domain "
+                f"this company would have bought, so no purchase completed - "
+                f"but an order that was refused or is still pending cannot be "
+                f"ruled out from the API. The claim is kept, and released "
+                f"automatically once it has stood for {CLAIM_MAX_AGE_DAYS} "
+                f"days with the account still empty of it")
+            return {
+                "status": "error",
+                "error": f"a domain purchase for {cn} is already outstanding "
+                         f"(domain_status='{db.DOMAIN_CLAIM}') and could not "
+                         f"be resolved automatically: {detail}. Clearing "
+                         f"domain_status by hand is what lets this company buy "
+                         f"again sooner.",
+            }
+        # The stale claim aged out and a fresh one was taken: carry on and buy.
 
     # Logged BEFORE the call, not after: if the process dies mid-order this
     # line is the only evidence that money may have moved.
@@ -731,13 +858,47 @@ def register_company_domain(company_name, details):
         # stage runner both treat a present "domain" as proof of purchase,
         # so returning it on a failure records a domain that was never
         # bought and marks the stage complete for good.
+        # The wording is deliberate. Namecheap does NOT document that every
+        # Status=ERROR response to domains.create leaves nothing charged -
+        # its own list for that command includes 3050900 "Unknown response
+        # from provider" and 5050900 "Unknown exceptions" - so this line
+        # records what is known (no order came back to record, the claim is
+        # released) and names the provider's error number rather than
+        # asserting that no money moved.
         _money_log.warning(
-            "domain order REJECTED cn=%s domain=%s; nothing charged, claim "
-            "released: %s", cn, domain, reg_result["error"])
-        db.update_row(cn, {"Domain Status": "error"})
+            "domain order REFUSED cn=%s domain=%s; no order was returned to "
+            "record and the claim is KEPT, because a refusal does not "
+            "establish that nothing was charged. Provider error %s. "
+            "Reconciling against the account now.",
+            cn, domain, reg_result["error"])
+        # The claim is KEPT. It used to be released here by writing
+        # domain_status='error', on the strength of "Namecheap rejected the
+        # order, so nothing was charged" - which Namecheap does not say, and
+        # which its own 3050900 "Unknown response from provider" and 5050900
+        # "Unknown exceptions" contradict. Releasing it let the next run issue
+        # a second billed order for a purchase whose outcome was unknown.
+        #
+        # Keeping it would strand the company, so the registrar is asked
+        # straight away: if the domain is in the account after all, this
+        # resolves itself and nobody is called in.
+        rec = reconcile_domain_claim(cn, company_name, attempted=domain)
+        if rec["status"] == "recovered":
+            return {
+                "status": "registered",
+                "domain": rec["domain"],
+                "charged": "",
+                "domain_id": "",
+                "order_id": "",
+                "reconciled": True,
+                "contacts_source": "recovered from the Namecheap account",
+                "alternatives": [],
+            }
         return {
             "status": "error",
-            "error": f"{reg_result['error']} (attempted domain: {domain})",
+            "error": f"{reg_result['error']} (attempted domain: {domain}). The "
+                     f"purchase claim is KEPT because a refusal does not "
+                     f"establish that nothing was charged; "
+                     f"{rec.get('error') or 'the account holds no domain for this company'}.",
             "attempted_domain": domain,
         }
 
@@ -763,13 +924,30 @@ def register_company_domain(company_name, details):
         _money_log.error(
             "domain order UNRESOLVED cn=%s domain=%s charged=%s order=%s; "
             "Namecheap reported Registered=false, claim KEPT to prevent a "
-            "second charge - reconcile by hand",
+            "second charge - reconciling against the account now",
             cn, domain, charged or "unknown",
             reg_result.get("order_id") or "unknown")
         if charged:
             # Record the amount WITHOUT touching domain_status, so the claim
             # survives while the operator has the figure to reconcile with.
             db.update_row(cn, {"Domain Cost": charged})
+        # A NonRealTimeDomain registration completes asynchronously, so
+        # Registered=false can simply mean "not yet". Ask the account: if the
+        # domain is already there, this resolves itself; if not, the next run
+        # asks again, and the company unsticks itself without a person the
+        # moment the registry catches up.
+        rec = reconcile_domain_claim(cn, company_name, attempted=domain)
+        if rec["status"] == "recovered":
+            return {
+                "status": "registered",
+                "domain": rec["domain"],
+                "charged": charged,
+                "domain_id": "",
+                "order_id": reg_result.get("order_id", ""),
+                "reconciled": True,
+                "contacts_source": "recovered from the Namecheap account",
+                "alternatives": [],
+            }
         return {
             "status": "unresolved",
             "error": (
@@ -777,8 +955,10 @@ def register_company_domain(company_name, details):
                 f"Registered=false (charged: {charged or 'unknown'}, order: "
                 f"{reg_result.get('order_id') or 'unknown'}). The domain may "
                 f"be pending rather than failed, so the purchase claim is "
-                f"kept to prevent a second charge. Reconcile against the "
-                f"Namecheap account, then clear domain_status by hand."
+                f"kept to prevent a second charge. The account was checked "
+                f"automatically just now and does not hold it yet; running "
+                f"this stage again will check again, and will finish the "
+                f"company by itself once the registry catches up."
             ),
             "attempted_domain": domain,
             "charged": charged,
@@ -864,34 +1044,74 @@ def setup_play_console_domain_assets(result, google_txt_token="", google_txt_hos
 # Step 4: Download certificate of incorporation
 # ============================================================
 
+# Companies House pages filing history (start_index / items_per_page) and does
+# NOT document the ordering of the items:
+# developer-specs.company-information.service.gov.uk/.../filing-history/list
+# describes both parameters and says nothing about order.
+#
+# This used to request ONE page of 100 with no start_index and then treat the
+# LAST item of that page as "the earliest filing". Both halves were wrong for
+# a long-lived company. Measured against a 121-filing history whose
+# incorporation sits behind 120 ordinary filings: the stage downloaded an
+# ACCOUNTS pdf and recorded it as the certificate of incorporation - not a
+# failure an operator would even notice, which is worse than one they would.
+_FH_PAGE_SIZE = 100
+_FH_MAX_PAGES = 10          # 1000 filings; the CH quota is shared, so it is capped
+
+
+def find_incorporation_document(company_number):
+    """Locate the incorporation filing's document link.
+
+    Returns (link, pages_fetched, reason). Pages only as far as it must: a
+    company whose incorporation is on the first page still costs one request,
+    because the budget is 600 per 5 minutes and the dashboard's admission
+    checks spend from the same pocket.
+    """
+    oldest = None           # (date, link) - the fallback, chosen BY DATE
+    pages = 0
+    for page in range(_FH_MAX_PAGES):
+        data = ch_get(f"/company/{company_number}/filing-history",
+                      {"items_per_page": _FH_PAGE_SIZE,
+                       "start_index": page * _FH_PAGE_SIZE})
+        pages += 1
+        items = data.get("items") or []
+        if not items:
+            break
+        for item in items:
+            link = (item.get("links") or {}).get("document_metadata")
+            if not link:
+                continue
+            cat = (item.get("category") or "").lower()
+            desc = (item.get("description") or "").lower()
+            ftype = (item.get("type") or "").upper()
+            if cat == "incorporation" or ftype == "NEWINC" or "incorporat" in desc:
+                return link, pages, ""
+            # A missing date sorts last, so any dated filing beats an undated one.
+            d = str(item.get("date") or "9999-99-99")
+            if oldest is None or d < oldest[0]:
+                oldest = (d, link)
+        total = data.get("total_count")
+        if total is not None and pages * _FH_PAGE_SIZE >= int(total):
+            break
+    if oldest:
+        return oldest[1], pages, (
+            f"no incorporation filing found in {pages} page(s); using the "
+            f"oldest filing with a document ({oldest[0]})")
+    return None, pages, "No documents available"
+
+
 def download_certificate(company_number, output_dir):
     """Download the certificate of incorporation PDF."""
     os.makedirs(output_dir, exist_ok=True)
 
-    data = ch_get(f"/company/{company_number}/filing-history", {"items_per_page": 100})
-
-    # Look for incorporation filing
-    doc_link = None
-    for item in data.get("items", []):
-        cat = (item.get("category") or "").lower()
-        desc = (item.get("description") or "").lower()
-        ftype = (item.get("type") or "").upper()
-        if cat == "incorporation" or ftype == "NEWINC" or "incorporat" in desc:
-            doc_link = item.get("links", {}).get("document_metadata")
-            if doc_link:
-                break
-
-    # Fallback: earliest filing with a document
-    if not doc_link:
-        filings_with_docs = [
-            item for item in data.get("items", [])
-            if item.get("links", {}).get("document_metadata")
-        ]
-        if filings_with_docs:
-            doc_link = filings_with_docs[-1].get("links", {}).get("document_metadata")
+    doc_link, _pages, why = find_incorporation_document(company_number)
 
     if not doc_link:
-        return None, "No documents available"
+        return None, why or "No documents available"
+    if why:
+        # Said out loud: the file about to be saved is NOT the certificate of
+        # incorporation, and the row will claim it is.
+        print(f"  certificate: {why}")
 
     # Build full URL
     if doc_link.startswith("/"):

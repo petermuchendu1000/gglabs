@@ -2434,12 +2434,27 @@ function closeLog() {
   document.getElementById("log-drawer").classList.remove("open");
 }
 
+// What to put in the drawer. A stage can finish having printed nothing — the
+// domain stage's whole narration goes through the money logger — and it can
+// fail by RETURNING a status rather than raising, in which case the job
+// carries the explanation in `error` (and the returned dict in `result`) while
+// `log` is empty. Showing "Waiting for output…" there is how a refused domain
+// order, an unresolved one that may have been charged, and a successful
+// purchase all looked identical and looked like nothing at all.
+function drawerText(j) {
+  if (j.log)    return j.log;
+  if (j.error)  return "Error: " + j.error;
+  if (j.result) return "Result: " + j.result;
+  if (j.status === "idle" || !j.status) return "No output yet.";
+  return "Waiting for output…";
+}
+
 async function refreshLogContent() {
   if (!S.logStage || !S.logCn) return;
   try {
     const j = await api("GET", `/api/v2/company/${S.logCn}/job/${S.logStage}`);
     const pre = document.getElementById("log-pre");
-    const log = j.log || (j.status === "idle" || !j.status ? "No output yet." : "Waiting for output…");
+    const log = drawerText(j);
     pre.textContent = log;
     pre.scrollTop = pre.scrollHeight;
 
