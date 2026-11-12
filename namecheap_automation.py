@@ -76,15 +76,32 @@ def _api_call(command, extra_params=None, method="GET"):
         ns = NS_HTTPS
 
     status = root.attrib.get("Status", "ERROR")
-    errors = []
+    errors: list[str] = []
+    error_numbers: list[str] = []
+    seen: list = []
     for err_container in [root.find("Errors", ns), root.find("nc:Errors", ns),
                           root.find("{http://api.namecheap.com/xml.response}Errors"),
                           root.find("{https://api.namecheap.com/xml.response}Errors")]:
-        if err_container is not None:
-            for err in err_container:
-                errors.append(err.text or err.attrib.get("Number", "Unknown error"))
+        # Four guesses at ONE element. For a namespaced response two of them
+        # hit the same node, so every error was appended TWICE - and that
+        # doubled text went into the money audit log and into what the
+        # operator was shown.
+        if err_container is None or any(c is err_container for c in seen):
+            continue
+        seen.append(err_container)
+        for err in err_container:
+            number = (err.attrib.get("Number") or "").strip()
+            text = (err.text or "").strip()
+            if number:
+                error_numbers.append(number)
+            # Keep the NUMBER. It is the only part a person can look up in
+            # Namecheap's error list, and discarding it left whoever was
+            # called in with a sentence and nothing to search for.
+            errors.append(f"{number}: {text}" if number and text
+                          else (text or number or "Unknown error"))
 
-    return {"root": root, "status": status, "errors": errors, "raw": resp.text, "ns": ns}
+    return {"root": root, "status": status, "errors": errors,
+            "error_numbers": error_numbers, "raw": resp.text, "ns": ns}
 
 
 # ============================================================
@@ -123,26 +140,67 @@ def check_domains(domain_list):
     return results
 
 
+# A DNS label cannot exceed 63 characters, and namecheap.domains.check takes
+# at most 50 domains per call (check_domains batches on exactly that).
+MAX_LABEL_LEN = 63
+MAX_CANDIDATES = 50
+
+
+def _domain_bases(company_name):
+    """Second-level labels worth trying, best first.
+
+    This used to be one label - the cleaned company name - plus an
+    abbreviation, and the abbreviation only when the cleaned name ran past 15
+    characters. Seven candidates in all. A company whose name is already taken
+    on all seven cheap TLDs stopped the pipeline and waited for a person to
+    choose a domain by hand, and that is the commonest reason this stage needs
+    one.
+
+    An availability check is not billed, so there is no reason to stop at
+    seven. What there IS reason to stop at: 50, which is what a single
+    domains.check call carries, and 63 characters, which is what a DNS label
+    carries - a longer label can only be refused, and a refusal from the
+    registry is the very failure this is trying to avoid.
+    """
+    clean = _company_name_to_domain(company_name)
+    if not clean:
+        return []
+    words = [w for w in clean.split("-") if w]
+    abbrev = "".join(w[0] for w in words)
+
+    # Best first: the name as it reads, then without hyphens, then with a
+    # suffix a UK company plausibly uses, then shortened to its first words,
+    # and last the initials - least recognisable, so least useful on a Play
+    # Console listing, but better than stopping.
+    ordered = [
+        clean,
+        clean.replace("-", ""),
+        f"{clean}-ltd",
+        f"{clean}-uk",
+        "-".join(words[:3]),
+        "-".join(words[:2]),
+        abbrev,
+    ]
+    bases, seen = [], set()
+    for b in ordered:
+        if not b or b in seen or len(b) < 2 or len(b) > MAX_LABEL_LEN:
+            continue
+        seen.add(b)
+        bases.append(b)
+    return bases[:max(1, MAX_CANDIDATES // len(CHEAP_TLDS))]
+
+
 def find_cheapest_domain(company_name):
     """
     Given a company name, generate domain candidates and find the cheapest available one.
     Returns the best option or None.
     """
-    # Clean company name for domain use
-    clean = _company_name_to_domain(company_name)
-    if not clean:
+    bases = _domain_bases(company_name)
+    if not bases:
         return {"error": "Could not generate domain name from company name"}
 
-    # Generate candidates with cheap TLDs
-    candidates = [f"{clean}{tld}" for tld in CHEAP_TLDS]
-
-    # Also try shorter variants
-    if len(clean) > 15:
-        # Try abbreviation (first letters of each word)
-        words = company_name.upper().replace("LTD", "").replace("LIMITED", "").split()
-        abbrev = "".join(w[0] for w in words if w).lower()
-        if len(abbrev) >= 2:
-            candidates.extend([f"{abbrev}{tld}" for tld in CHEAP_TLDS])
+    candidates = [f"{b}{tld}" for b in bases for tld in CHEAP_TLDS]
+    base_rank = {b: i for i, b in enumerate(bases)}
 
     results = check_domains(candidates)
     if isinstance(results, dict) and "error" in results:
@@ -159,7 +217,10 @@ def find_cheapest_domain(company_name):
                 return i
         return 99
 
-    available.sort(key=tld_priority)
+    # Price first, then how well the label spells the company: among equally
+    # cheap TLDs the name itself beats "name-ltd", which beats the initials.
+    available.sort(key=lambda d: (tld_priority(d),
+                                  base_rank.get(d["domain"].split(".")[0], 99)))
     return {"best": available[0], "alternatives": available[1:5]}
 
 
@@ -222,7 +283,9 @@ def register_domain(domain_name, years=1, registrant_info=None):
     resp = _api_call("domains.create", params, method="POST")
 
     if resp["status"] != "OK":
-        return {"error": f"Registration failed: {resp['errors']}", "raw": resp["raw"]}
+        return {"error": f"Registration failed: {resp['errors']}",
+                "error_numbers": resp.get("error_numbers", []),
+                "raw": resp["raw"]}
 
     # Parse result
     for node in resp["root"].iter():

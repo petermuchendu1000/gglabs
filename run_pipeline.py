@@ -731,9 +731,19 @@ def register_company_domain(company_name, details):
         # stage runner both treat a present "domain" as proof of purchase,
         # so returning it on a failure records a domain that was never
         # bought and marks the stage complete for good.
+        # The wording is deliberate. Namecheap does NOT document that every
+        # Status=ERROR response to domains.create leaves nothing charged -
+        # its own list for that command includes 3050900 "Unknown response
+        # from provider" and 5050900 "Unknown exceptions" - so this line
+        # records what is known (no order came back to record, the claim is
+        # released) and names the provider's error number rather than
+        # asserting that no money moved.
         _money_log.warning(
-            "domain order REJECTED cn=%s domain=%s; nothing charged, claim "
-            "released: %s", cn, domain, reg_result["error"])
+            "domain order REFUSED cn=%s domain=%s; no order was returned to "
+            "record and the claim is released. Provider error %s. If that "
+            "code is an 'unknown response/exception' one, check the Namecheap "
+            "account before running this company again.",
+            cn, domain, reg_result["error"])
         db.update_row(cn, {"Domain Status": "error"})
         return {
             "status": "error",
@@ -864,34 +874,74 @@ def setup_play_console_domain_assets(result, google_txt_token="", google_txt_hos
 # Step 4: Download certificate of incorporation
 # ============================================================
 
+# Companies House pages filing history (start_index / items_per_page) and does
+# NOT document the ordering of the items:
+# developer-specs.company-information.service.gov.uk/.../filing-history/list
+# describes both parameters and says nothing about order.
+#
+# This used to request ONE page of 100 with no start_index and then treat the
+# LAST item of that page as "the earliest filing". Both halves were wrong for
+# a long-lived company. Measured against a 121-filing history whose
+# incorporation sits behind 120 ordinary filings: the stage downloaded an
+# ACCOUNTS pdf and recorded it as the certificate of incorporation - not a
+# failure an operator would even notice, which is worse than one they would.
+_FH_PAGE_SIZE = 100
+_FH_MAX_PAGES = 10          # 1000 filings; the CH quota is shared, so it is capped
+
+
+def find_incorporation_document(company_number):
+    """Locate the incorporation filing's document link.
+
+    Returns (link, pages_fetched, reason). Pages only as far as it must: a
+    company whose incorporation is on the first page still costs one request,
+    because the budget is 600 per 5 minutes and the dashboard's admission
+    checks spend from the same pocket.
+    """
+    oldest = None           # (date, link) - the fallback, chosen BY DATE
+    pages = 0
+    for page in range(_FH_MAX_PAGES):
+        data = ch_get(f"/company/{company_number}/filing-history",
+                      {"items_per_page": _FH_PAGE_SIZE,
+                       "start_index": page * _FH_PAGE_SIZE})
+        pages += 1
+        items = data.get("items") or []
+        if not items:
+            break
+        for item in items:
+            link = (item.get("links") or {}).get("document_metadata")
+            if not link:
+                continue
+            cat = (item.get("category") or "").lower()
+            desc = (item.get("description") or "").lower()
+            ftype = (item.get("type") or "").upper()
+            if cat == "incorporation" or ftype == "NEWINC" or "incorporat" in desc:
+                return link, pages, ""
+            # A missing date sorts last, so any dated filing beats an undated one.
+            d = str(item.get("date") or "9999-99-99")
+            if oldest is None or d < oldest[0]:
+                oldest = (d, link)
+        total = data.get("total_count")
+        if total is not None and pages * _FH_PAGE_SIZE >= int(total):
+            break
+    if oldest:
+        return oldest[1], pages, (
+            f"no incorporation filing found in {pages} page(s); using the "
+            f"oldest filing with a document ({oldest[0]})")
+    return None, pages, "No documents available"
+
+
 def download_certificate(company_number, output_dir):
     """Download the certificate of incorporation PDF."""
     os.makedirs(output_dir, exist_ok=True)
 
-    data = ch_get(f"/company/{company_number}/filing-history", {"items_per_page": 100})
-
-    # Look for incorporation filing
-    doc_link = None
-    for item in data.get("items", []):
-        cat = (item.get("category") or "").lower()
-        desc = (item.get("description") or "").lower()
-        ftype = (item.get("type") or "").upper()
-        if cat == "incorporation" or ftype == "NEWINC" or "incorporat" in desc:
-            doc_link = item.get("links", {}).get("document_metadata")
-            if doc_link:
-                break
-
-    # Fallback: earliest filing with a document
-    if not doc_link:
-        filings_with_docs = [
-            item for item in data.get("items", [])
-            if item.get("links", {}).get("document_metadata")
-        ]
-        if filings_with_docs:
-            doc_link = filings_with_docs[-1].get("links", {}).get("document_metadata")
+    doc_link, _pages, why = find_incorporation_document(company_number)
 
     if not doc_link:
-        return None, "No documents available"
+        return None, why or "No documents available"
+    if why:
+        # Said out loud: the file about to be saved is NOT the certificate of
+        # incorporation, and the row will claim it is.
+        print(f"  certificate: {why}")
 
     # Build full URL
     if doc_link.startswith("/"):

@@ -80,3 +80,5 @@ __pycache__/
 venv/
 venvfresh/
 venv313/
+e2e/shots/
+e2e/.e2e_mode
