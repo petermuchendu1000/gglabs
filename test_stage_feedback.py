@@ -423,6 +423,122 @@ def shutil_which(cmd: str):
     return shutil.which(cmd)
 
 
+# ── "nothing was downloaded" is not a success ──────────────────────────────
+
+def _exec(cn: str, stage: str, row: dict | None = None) -> dict:
+    """Run the REAL _exec_stage through the REAL job runner."""
+    row = row or {"Company Number": cn, "Company Name": "TEST CO LTD"}
+    return _run_spawn(cn, stage, lambda: api_v2._exec_stage(cn, stage, row))
+
+
+def check_certificate_failure_marks_failed(r: Results) -> None:
+    """download_certificate reports a missing document by RETURNING
+    (None, reason) - run_pipeline.py:894 and :904 - never by raising. With no
+    status in the returned dict the job runner read that as success, so a
+    company with no certificate showed a green tick.
+    """
+    print("\ncertificate: nothing downloaded -> job failed")
+    import run_pipeline
+    saved = (run_pipeline.download_certificate, api_v2._update_excel_row)
+    writes: list = []
+    try:
+        api_v2._update_excel_row = lambda cn, updates: writes.append(updates)
+        run_pipeline.download_certificate = lambda cn, out: (None, "No documents available")
+        j = _exec("00000050", "certificate")
+        r.check("job status is failed", j.get("status") == "failed",
+                f"status was {j.get('status')!r}")
+        r.check("the reason reaches the operator",
+                "No documents available" in str(j.get("error") or ""),
+                f"error was {j.get('error')!r}")
+        r.check("nothing was written to the company row", writes == [],
+                f"writes were {writes!r}: a failed download must not mark the "
+                f"certificate as downloaded")
+
+        writes.clear()
+        run_pipeline.download_certificate = lambda cn, out: ("/tmp/Certificate_X.pdf", None)
+        j = _exec("00000051", "certificate")
+        r.check("a real download still reads done", j.get("status") == "done",
+                f"status was {j.get('status')!r}")
+        r.check("...and is still recorded on the row",
+                any("Certificate Path" in w for w in writes),
+                f"writes were {writes!r}")
+    finally:
+        run_pipeline.download_certificate, api_v2._update_excel_row = saved
+
+
+# ── every stage says one line ──────────────────────────────────────────────
+
+def check_every_stage_narrates(r: Results) -> None:
+    """A finished stage must leave something human in the job log.
+
+    Before this, five of the seven stages printed nothing at all, so the best
+    the drawer could do was dump the raw Python dict the stage returned.
+    """
+    print("\nevery stage narrates one line into the job log")
+    import run_pipeline
+    import email_pool
+
+    class FakePool:
+        def get_assigned_email(self, cn):
+            return ("", "", "")
+
+        def assign_next(self, company_number="", company_name=""):
+            return ("acct41@example.invalid", "Ada", "Byron")
+
+    saved = {
+        "details": run_pipeline.get_company_details,
+        "duns": run_pipeline.get_duns_number,
+        "cert": run_pipeline.download_certificate,
+        "domain": run_pipeline.register_company_domain,
+        "pool": email_pool.EmailPool,
+        "upd": api_v2._update_excel_row,
+    }
+    try:
+        api_v2._update_excel_row = lambda cn, updates: None
+        run_pipeline.get_company_details = lambda cn: {
+            "company_number": cn,
+            "row_updates": {"Company Name": "TEST CO LTD", "Status": "active",
+                            "Directors": "SMITH, Johnathan Archibald"}}
+        run_pipeline.get_duns_number = lambda cn, headless=True: {
+            "duns_number": "987654321", "status": "found"}
+        run_pipeline.download_certificate = lambda cn, out: ("/tmp/Certificate_Y.pdf", None)
+        run_pipeline.register_company_domain = lambda name, details: {
+            "status": "error", "error": "No available domains found"}
+        email_pool.EmailPool = FakePool
+
+        cases = [
+            ("details",     "00000060", ["Company Name", "Directors"]),
+            ("duns",        "00000061", ["987654321"]),
+            ("certificate", "00000062", ["Certificate_Y.pdf"]),
+            ("domain",      "00000063", ["No available domains found"]),
+            ("email",       "00000064", ["acct41@example.invalid"]),
+        ]
+        for stage, cn, wants in cases:
+            j = _exec(cn, stage)
+            log = str(j.get("log") or "")
+            r.check(f"{stage} wrote something to the job log", bool(log.strip()),
+                    f"log was {log!r}; the drawer would fall back to dumping "
+                    f"the returned dict")
+            for want in wants:
+                r.check(f"{stage} log mentions {want!r}", want in log,
+                        f"log was {log!r}")
+
+        # The details stage's row_updates carry director names and dates of
+        # birth. The job log names the COLUMNS it wrote, never the values, so
+        # the drawer does not become a second place personal data is printed.
+        j = _exec("00000065", "details")
+        r.check("details log does not print the director's name",
+                "SMITH, Johnathan Archibald" not in str(j.get("log") or ""),
+                f"log was {str(j.get('log'))!r}")
+    finally:
+        run_pipeline.get_company_details = saved["details"]
+        run_pipeline.get_duns_number = saved["duns"]
+        run_pipeline.download_certificate = saved["cert"]
+        run_pipeline.register_company_domain = saved["domain"]
+        email_pool.EmailPool = saved["pool"]
+        api_v2._update_excel_row = saved["upd"]
+
+
 # ── main ────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -439,6 +555,8 @@ def main() -> int:
     check_success_statuses_still_done(r)
     check_raise_still_marks_failed(r)
     check_run_all_stops_on_reported_failure(r)
+    check_certificate_failure_marks_failed(r)
+    check_every_stage_narrates(r)
     check_drawer_text(r)
     return r.report()
 

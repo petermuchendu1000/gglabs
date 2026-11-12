@@ -557,6 +557,13 @@ def _exec_stage(cn: str, stage: str, row: dict):
         # route had stored. One mapping, in one place, cannot drift from
         # the function that feeds it.
         _update_excel_row(cn, d["row_updates"])
+        # One line into the job log, so the drawer has something to show. The
+        # COLUMNS are named, never their values: row_updates carries director
+        # names and dates of birth, and the job log must not become a second
+        # place personal data is printed.
+        _cols = sorted(d["row_updates"])
+        print(f"  details: wrote {len(_cols)} column(s) from Companies House: "
+              f"{', '.join(_cols) or 'none'}")
         return d
 
     elif stage == "duns":
@@ -567,6 +574,11 @@ def _exec_stage(cn: str, stage: str, row: dict):
         elif r.get("status") == "submitted":
             _update_excel_row(cn, {"DUNS Status": "submitted",
                                    "DUNS Email Used": r.get("temp_email", "")})
+        if r.get("duns_number"):
+            print(f"  duns: {r['duns_number']} ({r.get('status') or 'found'})")
+        else:
+            print(f"  duns: no number (status={r.get('status') or 'unknown'})"
+                  + (f": {r['error']}" if r.get("error") else ""))
         return r
 
     elif stage == "certificate":
@@ -574,9 +586,19 @@ def _exec_stage(cn: str, stage: str, row: dict):
         from run_pipeline import download_certificate
         out = str(_co_dir(cn, name) / "certificate")
         path, err = _with_retry(lambda: download_certificate(cn, out))
-        if path:
-            _update_excel_row(cn, {"Certificate Downloaded": True, "Certificate Path": path})
-        return {"path": path, "error": err}
+        if not path:
+            # download_certificate says "there is no document" by RETURNING
+            # (None, reason) - run_pipeline.py:894 for a filing history with
+            # no document, :904 for a non-200 - and never by raising. Without
+            # a status this read as success, so a company with no certificate
+            # got a green tick and the reason was discarded.
+            print(f"  certificate: nothing downloaded: "
+                  f"{err or 'no reason given'}")
+            return {"status": "error",
+                    "error": err or "no certificate was downloaded"}
+        _update_excel_row(cn, {"Certificate Downloaded": True, "Certificate Path": path})
+        print(f"  certificate: saved {path}")
+        return {"status": "downloaded", "path": path, "error": err}
 
     elif stage == "domain":
         from run_pipeline import register_company_domain
@@ -593,7 +615,16 @@ def _exec_stage(cn: str, stage: str, row: dict):
         # purchase - which the failure path also satisfied, so a rejected
         # order was recorded as a registered domain and the stage was marked
         # complete for good. Do not reintroduce a write here.
-        return register_company_domain(name, details)
+        result = register_company_domain(name, details)
+        # The money logger narrates the billed order itself, and reaches this
+        # log through logging_setup's stdout handler. This line covers the
+        # paths that fail BEFORE the purchase claim is taken - no domain
+        # available, no company number, a refused availability check - which
+        # emit no money line at all.
+        print(f"  domain: {result.get('status') or 'unknown'}"
+              + (f" {result['domain']}" if result.get("domain") else "")
+              + (f": {result['error']}" if result.get("error") else ""))
+        return result
 
     elif stage == "email":
         from email_pool import EmailPool
@@ -604,10 +635,12 @@ def _exec_stage(cn: str, stage: str, row: dict):
             if not str(row.get("Assigned Email") or ""):
                 _update_excel_row(cn, {"Assigned Email": ex_email,
                                        "Account Name": f"{ex_first} {ex_last}"})
+            print(f"  email: {ex_email} (already assigned to this company)")
             return {"email": ex_email, "status": "already_assigned"}
         email, first, last = pool.assign_next(company_number=cn, company_name=name)
         _update_excel_row(cn, {"Assigned Email": email,
                                 "Account Name": f"{first} {last}"})
+        print(f"  email: {email} assigned from the pool")
         return {"email": email, "status": "assigned"}
 
     elif stage == "director_id":
