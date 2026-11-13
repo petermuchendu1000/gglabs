@@ -539,6 +539,134 @@ def check_every_stage_narrates(r: Results) -> None:
         api_v2._update_excel_row = saved["upd"]
 
 
+# ── a write that failed must never report success ──────────────────────────
+#
+# _update_excel_row caught every exception, printed "[db] update_row failed"
+# and returned None. Five routes then answered 200 and the dashboard toasted
+# "Saved N field(s)" for a write that never happened, and six stage call
+# sites carried on and let the job finish "done" without its result recorded.
+#
+# This is the same silent-success family as the rest of this file: the
+# certificate stage recording a failure as done, _spawn calling a refused
+# domain order done. A save that did not happen must not look like one that
+# did - that is the whole point.
+
+class _Boom(Exception):
+    pass
+
+
+def _client():
+    from flask import Flask
+    app = Flask(__name__)
+    app.register_blueprint(api_v2.api_v2)
+    return app.test_client()
+
+
+def _with_broken_db(fn):
+    """Run fn() with every row write failing, as a database outage would."""
+    import db
+    saved = (db.update_row, api_v2._find_row, api_v2._compute_stages)
+    try:
+        def boom(cn, updates):
+            raise _Boom("could not connect to server: Connection refused")
+        db.update_row = boom
+        api_v2._find_row = lambda cn: {"Company Number": cn,
+                                       "Company Name": "TEST CO LTD"}
+        api_v2._compute_stages = lambda cn, row: {s: False for s in api_v2.STAGE_ORDER}
+        return fn()
+    finally:
+        db.update_row, api_v2._find_row, api_v2._compute_stages = saved
+
+
+ROUTES = [
+    ("fields",    "/api/v2/company/00000800/fields",    {"fields": {"domain_status": ""}}),
+    ("status",    "/api/v2/company/00000800/status",    {"status": "On Hold"}),
+    ("notes",     "/api/v2/company/00000800/notes",     {"notes": "a note"}),
+    ("archive",   "/api/v2/company/00000800/archive",   None),
+    ("unarchive", "/api/v2/company/00000800/unarchive", None),
+]
+
+
+def check_failed_write_is_not_reported_as_saved(r: Results) -> None:
+    print("\na write that failed is not reported as saved")
+    try:
+        from flask import Flask  # noqa: F401
+    except ModuleNotFoundError as e:
+        r.skip("a write that failed is not reported as saved",
+               f"flask is not installed ({e})")
+        return
+
+    for name, path, body in ROUTES:
+        resp = _with_broken_db(
+            lambda: _client().post(path, json=body) if body is not None
+            else _client().post(path))
+        payload = resp.get_json(silent=True) or {}
+        r.check(f"/{name}: does not answer 2xx", not (200 <= resp.status_code < 300),
+                f"HTTP {resp.status_code} with {payload!r} - the dashboard reads "
+                f"any 2xx as a successful save")
+        r.check(f"/{name}: says what went wrong",
+                "Connection refused" in str(payload.get("error") or ""),
+                f"payload was {payload!r}; the UI shows e.error in its toast")
+
+
+def check_successful_write_still_reports_ok(r: Results) -> None:
+    print("\n...and a write that worked still reports success")
+    try:
+        from flask import Flask  # noqa: F401
+    except ModuleNotFoundError:
+        r.skip("a successful write still reports success", "flask is not installed")
+        return
+    import db
+    saved = (db.update_row, api_v2._find_row, api_v2._compute_stages)
+    written = []
+    try:
+        db.update_row = lambda cn, updates: written.append((cn, updates))
+        api_v2._find_row = lambda cn: {"Company Number": cn, "Company Name": "TEST CO LTD"}
+        api_v2._compute_stages = lambda cn, row: {s: False for s in api_v2.STAGE_ORDER}
+        resp = _client().post("/api/v2/company/00000801/fields",
+                              json={"fields": {"domain_status": ""}})
+        payload = resp.get_json(silent=True) or {}
+        r.check("200 is still 200", resp.status_code == 200,
+                f"HTTP {resp.status_code}: {payload!r}")
+        r.check("and it names what it wrote",
+                "Domain Status" in (payload.get("updated") or []), f"{payload!r}")
+        r.check("and the write actually happened", len(written) == 1, f"{written!r}")
+    finally:
+        db.update_row, api_v2._find_row, api_v2._compute_stages = saved
+
+
+def check_stage_whose_write_fails_is_not_done(r: Results) -> None:
+    """A stage that could not record its result has not finished its job."""
+    print("\na stage whose row write fails does not read as done")
+    import db
+    import email_pool
+
+    class FakePool:
+        def get_assigned_email(self, cn):
+            return ("", "", "")
+
+        def assign_next(self, company_number="", company_name=""):
+            return ("acct9@example.invalid", "Ada", "Byron")
+
+    saved = (db.update_row, email_pool.EmailPool)
+    try:
+        def boom(cn, updates):
+            raise _Boom("could not connect to server: Connection refused")
+        db.update_row = boom
+        email_pool.EmailPool = FakePool
+        j = _run_spawn("00000802", "email",
+                       lambda: api_v2._exec_stage(
+                           "00000802", "email",
+                           {"Company Number": "00000802", "Company Name": "TEST CO LTD"}))
+        r.check("the job is failed", j.get("status") == "failed",
+                f"status was {j.get('status')!r} - the email was assigned from the "
+                f"pool but never recorded, so the stage did not finish")
+        r.check("the reason is carried", "Connection refused" in str(j.get("error") or ""),
+                f"error was {j.get('error')!r}")
+    finally:
+        db.update_row, email_pool.EmailPool = saved
+
+
 # ── main ────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -557,6 +685,9 @@ def main() -> int:
     check_run_all_stops_on_reported_failure(r)
     check_certificate_failure_marks_failed(r)
     check_every_stage_narrates(r)
+    check_failed_write_is_not_reported_as_saved(r)
+    check_successful_write_still_reports_ok(r)
+    check_stage_whose_write_fails_is_not_done(r)
     check_drawer_text(r)
     return r.report()
 
