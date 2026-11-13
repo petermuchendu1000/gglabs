@@ -667,6 +667,158 @@ def check_stage_whose_write_fails_is_not_done(r: Results) -> None:
         db.update_row, email_pool.EmailPool = saved
 
 
+# ── an outage is an outage, not "no such company" ──────────────────────────
+#
+# _all_rows returned [] and _find_row returned None when the database could
+# not be reached, so a dashboard with a dead database showed "No companies
+# found" and every company answered 404 "Not found". Both are statements
+# about the DATA. Neither was true: nothing was known either way.
+#
+# pipeline.py:180 carries the same warning for the Namecheap listing - an
+# error response has no Domain elements, so an unchecked failure reads as an
+# account with nothing in it.
+
+def check_outage_is_not_an_empty_list(r: Results) -> None:
+    print("\nreads: a database outage is not an empty company list")
+    try:
+        from flask import Flask  # noqa: F401
+    except ModuleNotFoundError:
+        r.skip("a database outage is not an empty company list", "flask missing")
+        return
+    import db
+    saved = db.all_rows
+    try:
+        def boom(use_cache=True):
+            raise _Boom("could not connect to server: Connection refused")
+        db.all_rows = boom
+        resp = _client().get("/api/v2/companies")
+        payload = resp.get_json(silent=True)
+        r.check("it does not answer 200 with an empty list",
+                resp.status_code != 200,
+                f"HTTP {resp.status_code} with {payload!r} - an empty list reads "
+                f"as 'this pipeline has no companies'")
+        r.check("it says the database could not be reached",
+                "could not be reached" in str((payload or {}).get("error") or "").lower()
+                or "Connection refused" in str((payload or {}).get("error") or ""),
+                f"payload was {payload!r}")
+    finally:
+        db.all_rows = saved
+
+
+def check_outage_is_not_a_missing_company(r: Results) -> None:
+    print("\nreads: a database outage is not a missing company")
+    try:
+        from flask import Flask  # noqa: F401
+    except ModuleNotFoundError:
+        r.skip("a database outage is not a missing company", "flask missing")
+        return
+    import db
+    saved = db.find_row
+    try:
+        def boom(cn):
+            raise _Boom("could not connect to server: Connection refused")
+        db.find_row = boom
+        resp = _client().get("/api/v2/company/00000900")
+        payload = resp.get_json(silent=True)
+        r.check("it is not a 404", resp.status_code != 404,
+                f"HTTP {resp.status_code} - 404 says this company does not exist, "
+                f"which is a claim about the data nobody can make right now")
+        r.check("it says the database could not be reached",
+                "Connection refused" in str((payload or {}).get("error") or ""),
+                f"payload was {payload!r}")
+    finally:
+        db.find_row = saved
+
+
+def check_a_genuinely_missing_company_is_still_404(r: Results) -> None:
+    print("\nreads: a company that really is absent is still 404")
+    try:
+        from flask import Flask  # noqa: F401
+    except ModuleNotFoundError:
+        r.skip("a genuinely missing company is still 404", "flask missing")
+        return
+    import db
+    saved = db.find_row
+    try:
+        db.find_row = lambda cn: None
+        resp = _client().get("/api/v2/company/00000901")
+        r.check("404", resp.status_code == 404, f"HTTP {resp.status_code}")
+    finally:
+        db.find_row = saved
+
+
+def check_the_list_still_works(r: Results) -> None:
+    print("\nreads: a working database still lists companies")
+    try:
+        from flask import Flask  # noqa: F401
+    except ModuleNotFoundError:
+        r.skip("a working database still lists companies", "flask missing")
+        return
+    import db
+    saved = (db.all_rows, api_v2._compute_stages)
+    try:
+        db.all_rows = lambda use_cache=True: [
+            {"Company Number": "00000902", "Company Name": "TEST CO LTD"}]
+        api_v2._compute_stages = lambda cn, row: {s: False for s in api_v2.STAGE_ORDER}
+        resp = _client().get("/api/v2/companies")
+        payload = resp.get_json(silent=True) or []
+        r.check("200", resp.status_code == 200, f"HTTP {resp.status_code}")
+        r.check("with the company", any(c.get("cn") == "00000902" for c in payload),
+                f"{payload!r}")
+    finally:
+        db.all_rows, api_v2._compute_stages = saved
+
+
+_LIST_MSG_CASES = [
+    ("an outage says so", {"loadError": "Connection refused"}, "Could not reach"),
+    ("an outage names the reason", {"loadError": "Connection refused"}, "Connection refused"),
+    ("no companies still says that", {"loadError": ""}, "No companies found"),
+    ("no error key at all", {}, "No companies found"),
+]
+
+
+def check_sidebar_message(r: Results) -> None:
+    """The server now refuses to pretend, so the page must not pretend either."""
+    print("\nreads: the sidebar does not say 'No companies' during an outage")
+    page = os.path.join(REPO, "static", "app.html")
+    with open(page, encoding="utf-8") as f:
+        src = f.read()
+    fn = _extract_js_function(src, "companyListMessage")
+    if not r.check("static/app.html defines companyListMessage(state)", fn is not None,
+                   "an empty sidebar during an outage is the same lie the server "
+                   "just stopped telling"):
+        return
+    r.check("renderSidebar uses it",
+            re.search(r"companyListMessage\s*\(", src[src.index("function renderSidebar"):]
+                      if "function renderSidebar" in src else "") is not None,
+            "the function exists but the sidebar does not call it")
+    if not shutil_which("node"):
+        r.skip("sidebar message cases", "node is not on PATH")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        driver = os.path.join(td, "m.mjs")
+        with open(driver, "w", encoding="utf-8") as f:
+            f.write(fn + "\n")
+            f.write("const cases = " + json.dumps(
+                [[l, st, w] for l, st, w in _LIST_MSG_CASES]) + ";\n")
+            f.write("""
+const out = [];
+for (const [label, state, want] of cases) {
+  let text; try { text = String(companyListMessage(state)); } catch (e) { text = "ERR " + e; }
+  out.push({label, text, ok: text.includes(want)});
+}
+console.log(JSON.stringify(out));
+""")
+        proc = subprocess.run([shutil_which("node"), driver], capture_output=True,
+                              text=True, timeout=60)
+        if not r.check("node ran it", proc.returncode == 0, proc.stderr[:300]):
+            return
+        for (lbl, st, want), got in zip(_LIST_MSG_CASES,
+                                        json.loads(proc.stdout.strip().splitlines()[-1])):
+            r.check(f"sidebar: {lbl}", got["ok"],
+                    f"state {st!r} rendered {got['text']!r}, wanted {want!r}")
+
+
 # ── main ────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -688,6 +840,11 @@ def main() -> int:
     check_failed_write_is_not_reported_as_saved(r)
     check_successful_write_still_reports_ok(r)
     check_stage_whose_write_fails_is_not_done(r)
+    check_outage_is_not_an_empty_list(r)
+    check_outage_is_not_a_missing_company(r)
+    check_a_genuinely_missing_company_is_still_404(r)
+    check_the_list_still_works(r)
+    check_sidebar_message(r)
     check_drawer_text(r)
     return r.report()
 

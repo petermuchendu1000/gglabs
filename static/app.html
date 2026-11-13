@@ -1248,6 +1248,7 @@ const S = {
   sidebarDebounce: null,
   notesDebounce: null,
   addYears: new Set(),
+  loadError: "",
 };
 
 // ── API ───────────────────────────────────────────────────────────────────────
@@ -1283,8 +1284,13 @@ async function loadCompanies() {
     S.companies = [...active, ...archived];
     renderSidebar();
     renderSummary();
+    S.loadError = "";
   } catch(e) {
     console.error("load companies:", e);
+    // Kept, so the sidebar can say what happened instead of showing an
+    // empty list that reads as "there are no companies".
+    S.loadError = e && e.message ? e.message : String(e);
+    renderSidebar();
   }
 }
 
@@ -1406,7 +1412,7 @@ function renderSidebar() {
   const list = filteredList();
   const el = document.getElementById("company-list");
   if (!list.length) {
-    el.innerHTML = `<div class="empty-msg" style="padding:16px;text-align:center;">No companies found</div>`;
+    el.innerHTML = `<div class="empty-msg" style="padding:16px;text-align:center;">${x(companyListMessage(S))}</div>`;
     return;
   }
   el.innerHTML = list.map(c => {
@@ -2432,6 +2438,17 @@ function viewLog(stage) { openLog(stage); }
 
 function closeLog() {
   document.getElementById("log-drawer").classList.remove("open");
+}
+
+// What the company list says when it is empty. An outage used to read as
+// "No companies found", which is a claim about the data that nobody could
+// make while the database was unreachable - the same lie the server stopped
+// telling when _all_rows stopped answering an outage with [].
+function companyListMessage(state) {
+  if (state && state.loadError) {
+    return "Could not reach the database — " + state.loadError;
+  }
+  return "No companies found";
 }
 
 // What to put in the drawer. A stage can finish having printed nothing — the
