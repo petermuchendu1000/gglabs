@@ -648,6 +648,59 @@ def _safe_folder_name(company_name):
     return name or 'unknown'
 
 
+# How far above the quote an observed charge may be before it is treated as
+# bad data rather than as a price. Measured: .site quoted USD 1.78 and billed
+# USD 1.98, which is 11% over. Three times the quote is not a fee, it is a
+# wrong number, and it must not be allowed to stop the pipeline.
+_CHARGE_SANITY_MULTIPLE = 3.0
+
+
+def expected_charge(domain, quoted):
+    """What this domain will really cost, from what its TLD last billed.
+
+    The quote is not the bill. Measured in production: users.getPricing said
+    USD 1.78 for .site, domains.check reported IcannFee 0.0, and Namecheap
+    charged USD 1.98 - so a balance compared against the quote is short by
+    whatever the provider does not disclose.
+
+    Every past purchase already records what was actually charged, in Domain
+    Cost, so the real figure is knowable from the pipeline's own money
+    records. No new state, and no guess about a response shape Namecheap does
+    not document.
+
+    Returns (amount, source). Never returns less than the quote: an old
+    cheaper charge must not let an order through that today's price refuses.
+    """
+    from namecheap_automation import parse_money
+
+    if quoted is None or "." not in domain:
+        return quoted, "quoted"
+    tld = domain.split(".", 1)[1].lower()
+    try:
+        rows = db.all_rows()
+    except Exception:
+        return quoted, "quoted"
+
+    seen = []
+    for row in rows:
+        other = str(row.get("Domain") or "").strip().lower()
+        if not other or "." not in other or other.split(".", 1)[1] != tld:
+            continue
+        amount = parse_money(row.get("Domain Cost"))
+        if amount is not None and amount > 0:
+            seen.append(amount)
+    if not seen:
+        return quoted, "quoted"
+
+    observed = max(seen)
+    if observed > quoted * _CHARGE_SANITY_MULTIPLE:
+        # Not a price. Bad data must not block a purchase.
+        return quoted, "quoted"
+    if observed <= quoted:
+        return quoted, "quoted"
+    return observed, "billed"
+
+
 def reconcile_domain_claim(cn, company_name, attempted=""):
     """Ask the registrar what happened, instead of asking a person.
 
@@ -762,6 +815,7 @@ def register_company_domain(company_name, details):
     # handled.
     price = search_result.get("price")
     currency = search_result.get("currency")
+    price, price_source = expected_charge(domain, price)
     if price is not None:
         funds, funds_currency = available_balance()
         if funds is not None and funds_currency == currency and funds < price:
@@ -772,8 +826,14 @@ def register_company_domain(company_name, details):
                 funds_currency, funds, currency, price)
             fee = search_result.get("icann_fee") or 0.0
             base = search_result.get("base_price")
-            breakdown = (f" ({currency} {base:.2f} + {currency} {fee:.2f} "
-                         f"ICANN fee)" if fee and base is not None else "")
+            if price_source == "billed":
+                breakdown = (f" (what a {domain.split('.', 1)[1]} domain was "
+                             f"last billed at; the quote was "
+                             f"{currency} {base:.2f})" if base is not None else
+                             " (what this TLD was last billed at)")
+            else:
+                breakdown = (f" ({currency} {base:.2f} + {currency} {fee:.2f} "
+                             f"ICANN fee)" if fee and base is not None else "")
             return {
                 "status": "error",
                 "error": (f"insufficient funds: the Namecheap account has "

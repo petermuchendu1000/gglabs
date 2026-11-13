@@ -195,7 +195,7 @@ _PRICE_TTL = 6 * 3600          # prices do not move hourly
 _price_cache: dict = {}        # tld -> (expires_at, price, currency)
 
 
-def _money(value):
+def parse_money(value):
     """'1,234.56' / '$2.20' / '' -> float, or None. Never raises."""
     s = re.sub(r"[^0-9.]", "", str(value or ""))
     if not s or s.count(".") > 1:
@@ -204,6 +204,9 @@ def _money(value):
         return float(s)
     except ValueError:
         return None
+
+
+_money = parse_money          # the name this had before it was needed elsewhere
 
 
 def one_year_price(tld):
