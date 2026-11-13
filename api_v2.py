@@ -227,21 +227,48 @@ def _co_dir(cn: str, name: str = "") -> Path:
 _ROWS_CACHE = None  # retained for backwards-compat; caching now lives in db.py
 
 
+class DatabaseUnavailable(Exception):
+    """The row store could not be reached.
+
+    Deliberately NOT the same as "no such company". _all_rows used to answer
+    an outage with [] and _find_row with None, so a dashboard with a dead
+    database showed "No companies found" and every company answered 404 "Not
+    found". Both are statements about the DATA, and neither was true: nothing
+    was known either way.
+
+    pipeline.py:180 carries the same warning for the Namecheap listing - an
+    error response has no Domain elements, so an unchecked failure reads
+    exactly like an account with nothing in it.
+    """
+
+
 def _all_rows() -> list[dict]:
     """All company rows from Supabase, keyed by the original header labels."""
     try:
         return db.all_rows()
     except Exception as e:
-        print(f"  [db] all_rows failed: {e}")
-        return []
+        raise DatabaseUnavailable(str(e)) from e
 
 
 def _find_row(cn: str) -> dict | None:
+    """The company's row, or None if there is genuinely no such company."""
     try:
         return db.find_row(cn)
     except Exception as e:
-        print(f"  [db] find_row failed: {e}")
-        return None
+        raise DatabaseUnavailable(str(e)) from e
+
+
+@api_v2.errorhandler(DatabaseUnavailable)
+def _database_unavailable(e):
+    # One handler rather than a try/except at nineteen call sites. A stage
+    # running in a worker thread does not come through here: the job runner
+    # catches it and the job reads failed, which is the same answer in the
+    # place that answers it.
+    return jsonify({
+        "error": f"the database could not be reached: {e}",
+        "hint": "this is not a statement about the data - nothing could be "
+                "read either way",
+    }), 503
 
 
 def _update_excel_row(cn: str, updates: dict) -> None:
