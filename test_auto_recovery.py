@@ -494,7 +494,8 @@ class FakeRow:
 
 
 def _domain_stage(row: FakeRow, listing, register=None, available=True, rows=None,
-                  prices=None, balance=(None, None), icann_fee="0"):
+                  prices=None, balance=(None, None), icann_fee="0",
+                  available_tlds=None):
     """Run the real register_company_domain against stubbed boundaries.
 
     `rows` is what the rest of the company table looks like - reconciliation
@@ -513,7 +514,9 @@ def _domain_stage(row: FakeRow, listing, register=None, available=True, rows=Non
             else [{"Company Number": "14123456", "Domain": ""}])
         nc.check_domains = lambda lst: [
             {"domain": d, "available": available, "is_premium": False,
-             "registration_price": "0", "icann_fee": icann_fee} for d in lst]
+             "registration_price": "0", "icann_fee": icann_fee} for d in lst
+            if available_tlds is None
+            or any(d.endswith(t) for t in available_tlds)]
         nc.get_existing_account_contact = lambda: {"source": "stub"}
         nc.one_year_price = lambda tld: (prices or {}).get(tld, (None, None))
         nc.available_balance = lambda: balance
@@ -879,6 +882,70 @@ def _search_with_fees(name, available_names, prices, fees):
             nc.one_year_price = saved[1]
 
 
+def check_what_a_tld_actually_billed_is_used(r: Results) -> None:
+    """The quote is not the bill.
+
+    Measured in production: users.getPricing quoted USD 1.78 for .site,
+    domains.check reported IcannFee 0.0, and Namecheap billed 1.98. The
+    balance was therefore being compared against a number 20 cents short.
+
+    Every past purchase is already recorded - Domain Cost holds what was
+    actually charged - so what a TLD really bills is knowable from the
+    pipeline's own records, with no new state and no guess about a response
+    shape the provider does not document.
+    """
+    print("\nbalance: what the TLD actually billed last time is what is used")
+    row = FakeRow()
+    history = [{"Company Number": "99999999", "Domain": "someone.site",
+                "Domain Cost": "1.9800"},
+               {"Company Number": "14123456", "Domain": "", "Domain Cost": ""}]
+    out, ordered = _domain_stage(row, _EMPTY, rows=history,
+                                 prices={".site": (1.78, "USD")},
+                                 balance=(1.85, "USD"), available_tlds=[".site"])
+    r.check("NO order was issued", ordered == [],
+            f"{ordered!r} - 1.78 quoted is affordable at 1.85, but .site last "
+            f"billed 1.98 and that is what will be charged")
+    r.check("NO claim was taken", not row.claim_held, f"{row.row!r}")
+    r.check("the operator is shown the figure that was used",
+            "1.98" in str(out.get("error", "")), f"{out.get('error')!r}")
+    r.check("...and told where it came from",
+            "billed" in str(out.get("error", "")).lower(), f"{out.get('error')!r}")
+
+
+def check_observed_charge_never_lowers_the_estimate(r: Results) -> None:
+    print("\nbalance: a cheaper past charge never lowers the estimate")
+    row = FakeRow()
+    history = [{"Company Number": "99999999", "Domain": "someone.site",
+                "Domain Cost": "0.01"}]
+    out, ordered = _domain_stage(row, _EMPTY, rows=history,
+                                 prices={".site": (1.78, "USD")},
+                                 balance=(1.00, "USD"), available_tlds=[".site"])
+    r.check("the quote still refuses it", ordered == [],
+            f"{ordered!r} - a stale cheap charge must not let an order through")
+
+
+def check_absurd_past_charge_is_ignored(r: Results) -> None:
+    print("\nbalance: a wildly out-of-band past charge is not trusted")
+    row = FakeRow()
+    history = [{"Company Number": "99999999", "Domain": "someone.site",
+                "Domain Cost": "900.00"}]
+    out, ordered = _domain_stage(row, _EMPTY, rows=history,
+                                 prices={".site": (1.78, "USD")},
+                                 balance=(2.22, "USD"), available_tlds=[".site"])
+    r.check("the order still goes ahead", len(ordered) == 1,
+            f"{ordered!r} - 900.00 against a 1.78 quote is not a price, it is "
+            f"bad data, and must not block the pipeline")
+
+
+def check_no_history_uses_the_quote(r: Results) -> None:
+    print("\nbalance: with no past purchase the quote is used, as before")
+    row = FakeRow()
+    out, ordered = _domain_stage(row, _EMPTY, rows=[],
+                                 prices={".site": (1.78, "USD")},
+                                 balance=(2.22, "USD"), available_tlds=[".site"])
+    r.check("the order goes ahead", len(ordered) == 1, f"{ordered!r}")
+
+
 def check_icann_fee_is_part_of_the_price(r: Results) -> None:
     """YourPrice does not include the ICANN fee for a gTLD; the bill does.
 
@@ -1129,6 +1196,10 @@ def main() -> int:
     check_expiry_never_fires_when_recovered(r)
     check_real_prices_decide(r)
     check_account_rate_beats_list_price(r)
+    check_what_a_tld_actually_billed_is_used(r)
+    check_observed_charge_never_lowers_the_estimate(r)
+    check_absurd_past_charge_is_ignored(r)
+    check_no_history_uses_the_quote(r)
     check_icann_fee_is_part_of_the_price(r)
     check_fee_can_change_the_choice(r)
     check_no_fee_quoted_is_unchanged(r)
