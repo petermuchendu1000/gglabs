@@ -245,11 +245,40 @@ def _find_row(cn: str) -> dict | None:
 
 
 def _update_excel_row(cn: str, updates: dict) -> None:
-    """Update a company's columns in Supabase (name kept for call-site compat)."""
+    """Update a company's columns in Supabase (name kept for call-site compat).
+
+    RAISES on failure, deliberately. This used to catch everything, print
+    "[db] update_row failed" and return None, which meant:
+
+      - five routes answered 200 for a write that never happened, and the
+        dashboard toasted "Saved N field(s)" over it. An operator clearing a
+        stuck purchase claim by hand was told it had worked when it had not;
+      - a stage could finish "done" without its result recorded - the email
+        assigned from the pool, the certificate downloaded, the DUNS number
+        found, none of it written.
+
+    Same silent-success family as a refused domain order reading as done. A
+    write that did not happen must not look like one that did.
+    """
+    db.update_row(cn, updates)
+
+
+def _save_or_explain(cn: str, updates: dict):
+    """Write a row on behalf of a ROUTE. None on success, else a JSON error.
+
+    Routes answer a person, so they turn the failure into something the
+    dashboard can show, rather than letting a 500 reach the UI as
+    "HTTP 500" with the reason only in the server log.
+    """
     try:
-        db.update_row(cn, updates)
+        _update_excel_row(cn, updates)
     except Exception as e:
-        print(f"  [db] update_row failed: {e}")
+        return jsonify({
+            "error": f"the change was NOT saved: {e}",
+            "cn": cn,
+            "attempted": sorted(updates),
+        }), 500
+    return None
 
 
 def _add_company_row(cn: str, name: str, date_of_creation: str = "") -> None:
@@ -793,7 +822,9 @@ def v2_update_fields(cn):
     if not updates:
         return jsonify({"error": "no editable fields provided"}), 400
 
-    _update_excel_row(cn, updates)
+    failed = _save_or_explain(cn, updates)
+    if failed:
+        return failed
     fresh  = _find_row(cn) or {}
     stages = _compute_stages(cn, fresh)
     return jsonify({"status": "ok", "cn": cn,
@@ -1374,7 +1405,9 @@ def v2_archive_company(cn):
     row = _find_row(cn)
     if not row:
         return jsonify({"error": "Company not found"}), 404
-    _update_excel_row(cn, {"Archived": "Yes"})
+    failed = _save_or_explain(cn, {"Archived": "Yes"})
+    if failed:
+        return failed
     return jsonify({"status": "archived", "cn": cn, "archived": True})
 
 
@@ -1384,7 +1417,9 @@ def v2_unarchive_company(cn):
     row = _find_row(cn)
     if not row:
         return jsonify({"error": "Company not found"}), 404
-    _update_excel_row(cn, {"Archived": "No"})
+    failed = _save_or_explain(cn, {"Archived": "No"})
+    if failed:
+        return failed
     return jsonify({"status": "unarchived", "cn": cn, "archived": False})
 
 
@@ -1402,7 +1437,9 @@ def v2_update_status(cn):
     if status and status not in valid_statuses:
         return jsonify({"error": f"Invalid status. Must be one of: {', '.join(valid_statuses)}"}), 400
     
-    _update_excel_row(cn, {"Company Status": status})
+    failed = _save_or_explain(cn, {"Company Status": status})
+    if failed:
+        return failed
     return jsonify({"status": "updated", "cn": cn, "company_status": status})
 
 
@@ -1419,7 +1456,9 @@ def v2_update_notes(cn):
     if len(notes) > 1000:
         return jsonify({"error": "Notes must be 1000 characters or less"}), 400
     
-    _update_excel_row(cn, {"Company Notes": notes})
+    failed = _save_or_explain(cn, {"Company Notes": notes})
+    if failed:
+        return failed
     return jsonify({"status": "updated", "cn": cn, "notes": notes})
 
 
