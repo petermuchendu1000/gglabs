@@ -625,11 +625,30 @@ def _exec_stage(cn: str, stage: str, row: dict):
     elif stage == "duns":
         from run_pipeline import get_duns_number
         r = get_duns_number(cn, headless=True)
+        updates = {}
         if r.get("duns_number"):
-            _update_excel_row(cn, {"DUNS Number": r["duns_number"], "DUNS Status": "found"})
-        elif r.get("status") == "submitted":
-            _update_excel_row(cn, {"DUNS Status": "submitted",
-                                   "DUNS Email Used": r.get("temp_email", "")})
+            updates["DUNS Number"] = r["duns_number"]
+            updates["DUNS Status"] = "found"
+        # get_duns_number RETURNS the D&B legal name and address
+        # (run_pipeline.py:586-592) and this stage dropped both, so they were
+        # only ever filled by the batch CLI path and looked, on a
+        # dashboard-only workflow, like something an operator had to type.
+        #
+        # Written only when present: db._norm turns "" into None and
+        # db.update_row has no blank-skip, so a blank here is a NULL over
+        # whatever was there before - including a value typed by hand.
+        for _key, _header in (("dnb_name", "D&B Legal Name"),
+                              ("dnb_address", "D&B Address")):
+            _value = str(r.get(_key) or "").strip()
+            if _value:
+                updates[_header] = _value
+        if updates:
+            _update_excel_row(cn, updates)
+        # There is deliberately no branch here writing DUNS Email Used from
+        # r["temp_email"]: get_duns_number returns found/not_found/error and
+        # never a temp_email key, so the branch that did could never run. The
+        # real address is the mail.tm one duns_automation creates, and it
+        # reaches the row through duns_automation.sync_duns_to_company_row.
         if r.get("duns_number"):
             print(f"  duns: {r['duns_number']} ({r.get('status') or 'found'})")
         else:
@@ -692,12 +711,45 @@ def _exec_stage(cn: str, stage: str, row: dict):
                 _update_excel_row(cn, {"Assigned Email": ex_email,
                                        "Account Name": f"{ex_first} {ex_last}"})
             print(f"  email: {ex_email} (already assigned to this company)")
-            return {"email": ex_email, "status": "already_assigned"}
-        email, first, last = pool.assign_next(company_number=cn, company_name=name)
-        _update_excel_row(cn, {"Assigned Email": email,
-                                "Account Name": f"{first} {last}"})
-        print(f"  email: {email} assigned from the pool")
-        return {"email": email, "status": "assigned"}
+            email, assigned = ex_email, "already_assigned"
+        else:
+            email, first, last = pool.assign_next(company_number=cn, company_name=name)
+            _update_excel_row(cn, {"Assigned Email": email,
+                                    "Account Name": f"{first} {last}"})
+            print(f"  email: {email} assigned from the pool")
+            assigned = "assigned"
+
+        # dev@<domain> has to forward to the Gmail account that owns the Play
+        # Console listing, and it is a BLOCKING readiness check
+        # (play_console_readiness.py:328). pipeline.stage_email configures it
+        # in the batch path and writes nothing back; the dashboard never
+        # configured it at all, so Dev Email Forwarding stayed empty here.
+        domain = str(row.get("Domain") or "").strip()
+        if not domain:
+            # The domain stage runs before this one, so this is a company
+            # whose purchase has not succeeded yet. Nothing to forward to,
+            # and nothing recorded - a later run fills it.
+            print("  email: no domain yet, so dev@ forwarding was not attempted")
+            return {"email": email, "status": assigned}
+
+        from namecheap_automation import ensure_dev_email_forwarding
+        fwd = ensure_dev_email_forwarding(domain, email)
+        fwd_status = str(fwd.get("status") or "unknown")
+        _update_excel_row(cn, {"Dev Email Forwarding": fwd_status})
+        print(f"  email: dev@{domain} -> {email} ({fwd_status})")
+        if fwd_status != "configured":
+            # Not a footnote: without this forward the company cannot pass
+            # Play Console review, so the stage has not finished its job.
+            # Re-running is safe - assigning an email is idempotent.
+            return {
+                "status": "error",
+                "email": email,
+                "error": (f"the email {email} is assigned, but dev@{domain} "
+                          f"forwarding is {fwd_status}: "
+                          f"{fwd.get('error') or 'no reason given'}"),
+            }
+        return {"email": email, "status": assigned,
+                "dev_email_forwarding": fwd_status}
 
     elif stage == "director_id":
         _clean_stage_output(cn, name, "director_id")

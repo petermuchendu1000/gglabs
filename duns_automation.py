@@ -815,6 +815,48 @@ def initiate_duns_request(company_number, phone_number=""):
     }
 
 
+def sync_duns_to_company_row(company_number):
+    """Copy what the DUNS store knows into the company row.
+
+    This module keeps its OWN json store and has never written the companies
+    table, so the mail.tm address it creates (create_temp_email), the request
+    status and even the DUNS number itself stayed here - and the row's
+    "DUNS Email Used" column could only ever be filled by hand, which made it
+    look like something an operator was supposed to supply. It is not: the
+    address is generated in code.
+
+    Writes only what it has. A record with no email does not blank the
+    column - db._norm turns "" into None and db.update_row has no blank-skip,
+    so a blank would be a NULL over whatever was there.
+
+    Returns the headers written. RAISES if the row cannot be written: the
+    DUNS record is already saved by then, so the caller reports the failure
+    rather than losing it.
+    """
+    import db
+
+    cn = str(company_number or "").strip()
+    record = (_load_duns_db() or {}).get(cn) or {}
+    if not record:
+        return {}
+
+    updates = {}
+    address = str((record.get("temp_email") or {}).get("address") or "").strip()
+    if address:
+        updates["DUNS Email Used"] = address
+    number = str(record.get("duns_number") or "").strip()
+    if number:
+        updates["DUNS Number"] = number
+    status = str(record.get("status") or "").strip()
+    if status:
+        updates["DUNS Status"] = status
+    if not updates:
+        return {}
+
+    db.update_row(cn, updates)
+    return updates
+
+
 def check_duns_emails(company_number):
     """Check temp email for DUNS-related messages for a company."""
     db = _load_duns_db()

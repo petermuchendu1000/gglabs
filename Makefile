@@ -27,6 +27,7 @@ HERMETIC_TESTS := \
 	test_kenyan_filter.py \
 	test_match_stage.py \
 	test_no_committed_secrets.py \
+	test_row_completeness.py \
 	test_stage_feedback.py
 
 .PHONY: help test e2e

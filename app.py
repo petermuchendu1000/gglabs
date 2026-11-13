@@ -585,7 +585,24 @@ from duns_automation import (
     stealth_request_duns,
     stealth_apply_duns,
     stealth_full_pipeline,
+    sync_duns_to_company_row,
 )
+
+
+def _attach_row_sync(result, company_number):
+    """Copy the DUNS store's findings into the company row, and say if it failed.
+
+    duns_automation keeps its own store and never wrote the companies table,
+    so the temp email it creates, the request status and the DUNS number
+    itself never reached the row - "DUNS Email Used" could only be typed by
+    hand. Reported rather than raised: the DUNS record is already saved, and
+    swallowing the failure is how a column goes quietly empty.
+    """
+    try:
+        result["row_updated"] = sorted(sync_duns_to_company_row(company_number))
+    except Exception as e:
+        result["row_sync_error"] = str(e)
+    return result
 
 
 @app.route("/api/duns/initiate/<company_number>", methods=["POST"])
@@ -596,6 +613,7 @@ def api_duns_initiate(company_number):
         if request.is_json:
             phone = request.json.get("phone", "")
         result = initiate_duns_request(company_number, phone_number=phone)
+        _attach_row_sync(result, company_number)
         status_code = 200 if result.get("status") != "error" else 400
         return jsonify(result), status_code
     except Exception as e:
@@ -607,6 +625,7 @@ def api_duns_check_email(company_number):
     """Check temp email for DUNS communications."""
     try:
         result = check_duns_emails(company_number)
+        _attach_row_sync(result, company_number)
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -632,6 +651,7 @@ def api_duns_set(company_number):
         if not data or not data.get("duns_number"):
             return jsonify({"error": "duns_number required"}), 400
         result = manually_set_duns(company_number, data["duns_number"])
+        _attach_row_sync(result, company_number)
         if "error" in result:
             return jsonify(result), 400
         return jsonify(result)
