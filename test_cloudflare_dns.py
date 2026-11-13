@@ -17,11 +17,13 @@ let through code that reads a field the API does not send.
 
 The four defects under test, each of which would look like success:
 
- 1. HARDCODED NAMESERVERS. Cloudflare assigns the pair PER ZONE. On this
-    account 22 of 26 zones answer on lauryn/maciej and only 4 on
-    houston/serena. Setting one fixed pair at the registrar leaves five
-    domains in six delegated to nameservers that do not serve them - and
-    nothing errors, the zone just stays pending for ever.
+ 1. HARDCODED NAMESERVERS. Cloudflare assigns the pair per zone, and rotates
+    which pair it hands out. On this account every zone created up to
+    2026-10-10 got lauryn/maciej and every zone created from 2026-10-13 got
+    houston/serena - a clean cut with no interleaving, and no announcement.
+    A fixed pair is therefore correct until the next rotation and silently
+    wrong after it: the domain is delegated to nameservers that do not serve
+    its zone, nothing errors, and the zone just stays pending for ever.
  2. POLLING THE ACTIVATION CHECK. PUT /activation_check is capped at once an
     hour on a Free zone. A poll loop built on it reports a healthy
     delegation as broken.
@@ -49,11 +51,14 @@ ACCOUNT_ID = "00000000000000000000000000000000"
 ZONE_ID = "9a1b2c3d4e5f60718293a4b5c6d7e8f9"
 OTHER_ZONE_ID = "ffffffffffffffffffffffffffffffff"
 
-# The two pairs that really exist on this account (EV-008). Neither is ever
-# written into cloudflare_dns.py - that is what test_no_hardcoded_nameservers
-# enforces.
-PAIR_MAJORITY = ["lauryn.ns.cloudflare.com", "maciej.ns.cloudflare.com"]
-PAIR_MINORITY = ["houston.ns.cloudflare.com", "serena.ns.cloudflare.com"]
+# The two pairs that really exist on this account, named by WHEN Cloudflare
+# handed them out rather than by how many zones carry them: PAIR_RETIRED went
+# to every zone created up to 2026-10-10, PAIR_CURRENT to every zone created
+# from 2026-10-13. Neither is ever written into cloudflare_dns.py - that is
+# what check_no_hardcoded_nameservers enforces, and a test that used only one
+# of them would pass just as well against code that hardcoded that one.
+PAIR_RETIRED = ["lauryn.ns.cloudflare.com", "maciej.ns.cloudflare.com"]
+PAIR_CURRENT = ["houston.ns.cloudflare.com", "serena.ns.cloudflare.com"]
 # What Namecheap's own nameservers look like, for the rejection test.
 NAMECHEAP_NS = ["dns1.registrar-servers.com", "dns2.registrar-servers.com"]
 
@@ -71,7 +76,7 @@ def zone_fixture(domain="simon-mwangi.site", status="active",
         "activated_on": "2026-08-17T02:45:18.167022Z",
         "created_on": "2026-08-17T02:30:00.000000Z",
         "modified_on": "2026-08-17T02:45:18.167022Z",
-        "name_servers": PAIR_MAJORITY if name_servers is None else name_servers,
+        "name_servers": PAIR_RETIRED if name_servers is None else name_servers,
         "original_name_servers": NAMECHEAP_NS,
         "original_registrar": "namecheap, inc. (id: 1068)",
         "original_dnshost": None,
@@ -192,23 +197,23 @@ def with_http(routes):
 def check_nameserver_validation(r: Results) -> None:
     print("\ndefect 1: a delegation target is only usable if Cloudflare gave it")
 
-    ok = cf.validate_nameservers(PAIR_MAJORITY)
-    r.check("a real Cloudflare pair validates", ok == PAIR_MAJORITY, repr(ok))
+    ok = cf.validate_nameservers(PAIR_RETIRED)
+    r.check("a real Cloudflare pair validates", ok == PAIR_RETIRED, repr(ok))
 
-    ok2 = cf.validate_nameservers(PAIR_MINORITY)
+    ok2 = cf.validate_nameservers(PAIR_CURRENT)
     r.check("the OTHER real pair validates too, unchanged",
-            ok2 == PAIR_MINORITY, repr(ok2))
+            ok2 == PAIR_CURRENT, repr(ok2))
 
     for bad, why in [
         ([], "an empty list"),
-        (PAIR_MAJORITY[:1], "a single nameserver"),
+        (PAIR_RETIRED[:1], "a single nameserver"),
         (None, "None"),
         ("lauryn.ns.cloudflare.com", "a bare string"),
         (NAMECHEAP_NS, "Namecheap's own nameservers"),
         ([""], "a blank entry"),
-        ([PAIR_MAJORITY[0], ""], "one good and one blank"),
-        ([PAIR_MAJORITY[0], None], "one good and one None"),
-        ([PAIR_MAJORITY[0], PAIR_MAJORITY[0]], "the same host twice"),
+        ([PAIR_RETIRED[0], ""], "one good and one blank"),
+        ([PAIR_RETIRED[0], None], "one good and one None"),
+        ([PAIR_RETIRED[0], PAIR_RETIRED[0]], "the same host twice"),
     ]:
         raised = False
         try:
@@ -225,15 +230,15 @@ def check_nameserver_validation(r: Results) -> None:
     cleaned = cf.validate_nameservers(
         ["LAURYN.ns.cloudflare.com.", " maciej.ns.cloudflare.com "])
     r.check("normalises case, trailing dot and whitespace",
-            cleaned == PAIR_MAJORITY, repr(cleaned))
+            cleaned == PAIR_RETIRED, repr(cleaned))
 
 
 def check_create_zone_returns_what_cloudflare_sent(r: Results) -> None:
     print("\ndefect 1: create_zone reports the pair Cloudflare assigned, not a constant")
     os.environ["CLOUDFLARE_ACCOUNT_ID"] = ACCOUNT_ID
 
-    for pair, label in [(PAIR_MAJORITY, "majority pair"),
-                        (PAIR_MINORITY, "minority pair")]:
+    for pair, label in [(PAIR_RETIRED, "retired pair"),
+                        (PAIR_CURRENT, "current pair")]:
         fake = with_http({"POST /zones": (200, envelope(
             zone_fixture(status="pending", name_servers=pair)))})
         out = cf.create_zone("simon-mwangi.site")
@@ -300,8 +305,9 @@ def check_no_hardcoded_nameservers(r: Results) -> None:
                 offenders.append((getattr(node, "lineno", "?"), node.value))
     r.check("no executable string names a specific Cloudflare nameserver",
             not offenders,
-            f"found {offenders!r} - a fixed pair mis-delegates the 22 of 26 "
-            f"zones that use the other one")
+            f"found {offenders!r} - a fixed pair is correct only until "
+            f"Cloudflare next rotates the one it assigns, and this account has "
+            f"been rotated once already")
     r.check("the suffix constant is the only nameserver literal",
             cf.CF_NS_SUFFIX == ".ns.cloudflare.com", repr(cf.CF_NS_SUFFIX))
 
@@ -617,7 +623,7 @@ def check_create_zone_idempotency(r: Results) -> None:
     r.check("an existing zone is adopted", out.get("zone_id") == ZONE_ID, repr(out))
     r.check("...and reported created=False", out.get("created") is False, repr(out))
     r.check("...with validated nameservers",
-            out.get("name_servers") == PAIR_MAJORITY, repr(out))
+            out.get("name_servers") == PAIR_RETIRED, repr(out))
 
     # Refused, and it does not exist: a real failure.
     fake = with_http({

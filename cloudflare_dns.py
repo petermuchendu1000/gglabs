@@ -17,15 +17,23 @@ the module exists in this shape.
 
 1. THE NAMESERVERS ARE PER ZONE AND MUST BE READ BACK, NEVER HARDCODED.
    Cloudflare documents name_servers as "The name servers Cloudflare assigns
-   to a zone", and that is literally true per zone. Measured on the account
-   this pipeline uses (EV-008): of 26 live zones, 22 answer on
-   lauryn/maciej.ns.cloudflare.com and only 4 on houston/serena. The
-   documentation's own example shows a third pair, bob/lola. Setting one fixed
-   pair at the registrar would therefore point roughly five domains in six at
-   nameservers that do not serve their zone. Nothing bounces: the zone simply
-   stays pending for ever and the domain never resolves. So create_zone()
-   refuses to report success unless Cloudflare actually told us the pair, and
-   the pair it returns is the only thing a caller may set at the registrar.
+   to a zone", and the pair it assigns CHANGES OVER TIME. Measured on the
+   account this pipeline uses, all 26 zones sorted by creation date: every
+   zone created up to 2026-10-10 was given lauryn/maciej.ns.cloudflare.com,
+   and every zone created from 2026-10-13 onwards was given houston/serena -
+   a clean cut, no interleaving. Cloudflare rotated the pair for this account
+   in that gap, and announced nothing. The documentation's own example shows a
+   third pair again, bob/lola.
+
+   So a hardcoded pair is not wrong today; it is wrong on an unknown future
+   date. When the next rotation lands, every domain registered after it gets
+   delegated to nameservers that do not serve its zone, and the only symptom
+   is a zone that stays pending for ever - no bounce, no error, nothing in a
+   log. One rotation has been observed in 5.5 months of this account's
+   history, which is not a rate and is not used as one. Reading the pair out
+   of the create response costs one field access and cannot go stale, so
+   create_zone() refuses to report success unless Cloudflare actually told us
+   the pair, and that pair is the only thing a caller may set at the registrar.
 
 2. WAITING FOR ACTIVATION POLLS THE ZONE, NOT THE ACTIVATION CHECK.
    PUT /zones/{id}/activation_check is rate limited to once an hour on a Free
