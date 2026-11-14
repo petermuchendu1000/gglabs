@@ -616,3 +616,217 @@ def list_routing_rules(zone_id, expected_domain):
             "actions": r.get("actions") or [],
         })
     return {"domain": expected_domain, "zone_id": zone_id, "rules": rules}
+
+
+def list_destination_addresses():
+    """Account-level forward targets, with their verification state.
+
+    Destination addresses are per ACCOUNT, not per zone (EV-010), and
+    Cloudflare requires each to be verified before it can receive forwarded
+    mail: "Destination addresses need to be verified before they can be
+    used." Verification is a human clicking a link IN that mailbox, which is
+    why ensure_dev_route prefers a Worker.
+    """
+    account_id = _account_id()
+    if not account_id:
+        return {"error": "CLOUDFLARE_ACCOUNT_ID is not set"}
+    call = _request("GET", "/accounts/%s/email/routing/addresses" % account_id,
+                    params={"per_page": 50})
+    if not call["ok"]:
+        return _failed(call, "Could not list destination addresses")
+    rows = call["result"] if isinstance(call["result"], list) else []
+    return {"addresses": [
+        {"id": a.get("id") or a.get("tag"),
+         "email": (a.get("email") or "").lower(),
+         # The API returns a timestamp, or null for unverified. Coerce to a
+         # bool here so no caller has to remember that a DATE means "yes".
+         "verified": bool(a.get("verified"))}
+        for a in rows if isinstance(a, dict)]}
+
+
+def ensure_destination_address(email):
+    """Make sure `email` is a destination address, and say if it is verified.
+
+    Creating one does NOT make it usable. Cloudflare sends a verification
+    mail and the address stays unusable until somebody opens that mailbox and
+    clicks. This function therefore never reports success on a fresh address;
+    it reports verified=False so the caller can refuse to claim a working
+    route.
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        return {"error": "a destination email is required"}
+    account_id = _account_id()
+    if not account_id:
+        return {"error": "CLOUDFLARE_ACCOUNT_ID is not set"}
+
+    listing = list_destination_addresses()
+    if "error" in listing:
+        return listing
+    for addr in listing["addresses"]:
+        if addr["email"] == email:
+            addr = dict(addr)
+            addr["created"] = False
+            return addr
+
+    call = _request("POST", "/accounts/%s/email/routing/addresses" % account_id,
+                    body={"email": email})
+    if not call["ok"]:
+        return _failed(call, "Could not add destination address %s" % email)
+    result = call["result"] if isinstance(call["result"], dict) else {}
+    return {"id": result.get("id") or result.get("tag"),
+            "email": email,
+            "verified": bool(result.get("verified")),
+            "created": True}
+
+
+def _rule_for_address(zone_id, expected_domain, address):
+    """The existing routing rule whose matcher is exactly `address`, or None.
+
+    Matching is on the matcher VALUE, never on position or name, and only an
+    exact literal match counts. A rule for any other address is invisible to
+    this function, which is what keeps ensure_dev_route from ever touching a
+    rule it did not create.
+    """
+    rules = list_routing_rules(zone_id, expected_domain)
+    if "error" in rules:
+        return rules
+    for rule in rules["rules"]:
+        for matcher in rule.get("matchers") or []:
+            if (str(matcher.get("type")) == "literal"
+                    and str(matcher.get("field")) == "to"
+                    and str(matcher.get("value") or "").lower() == address):
+                return {"rule": rule}
+    return {"rule": None}
+
+
+def ensure_dev_route(domain, worker=None, forward_to=None, local_part="dev"):
+    """Route <local_part>@domain with Cloudflare Email Routing.
+
+    This replaces namecheap_automation.ensure_dev_email_forwarding, which
+    cannot survive delegation: Namecheap's free forwarding requires Namecheap
+    DNS, so the moment a domain's nameservers point at Cloudflare that
+    forward stops existing.
+
+    Two possible destinations, and they are NOT equivalent:
+
+      worker=<script name>   preferred. Needs no destination verification at
+                             all, so it adds no human step, and the mail
+                             terminates inside our own system instead of
+                             being handed to the same Google account that is
+                             being verified.
+      forward_to=<address>   like-for-like with the old Namecheap behaviour,
+                             but Cloudflare will not deliver to an address a
+                             human has not verified by clicking a link in it.
+                             With a pool of one Gmail per company that is one
+                             manual step per company.
+
+    Returns a dict whose "status" is one of:
+      configured            the route exists and will deliver
+      not_delegated         the domain has no zone here, so there is nothing
+                            to configure -- the delegate stage has not run
+      routing_not_ready     Email Routing is on but Cloudflare does not
+                            report it ready, so mail would not arrive
+      pending_verification  a forward target exists but nobody has verified it
+      error                 Cloudflare could not be reached or refused
+
+    "not_delegated" is deliberately NOT an error: it is the normal state of a
+    domain the delegate stage has not reached yet, and the caller needs to
+    tell those two apart.
+    """
+    domain = (domain or "").strip().lower().rstrip(".")
+    if not domain:
+        return {"status": "error", "error": "domain is required"}
+    local_part = (local_part or "dev").strip().lower()
+    address = "%s@%s" % (local_part, domain)
+
+    zone = find_zone(domain)
+    if "error" in zone:
+        # Could not ASK. Must not be reported as "not delegated", which would
+        # send the caller down the create-a-zone path on an outage.
+        return {"status": "error", "domain": domain, "address": address,
+                "error": zone["error"]}
+    if not zone.get("found"):
+        return {"status": "not_delegated", "domain": domain, "address": address,
+                "message": ("%s has no zone in this Cloudflare account, so "
+                            "dev@ routing cannot be configured until the "
+                            "domain is delegated" % domain)}
+    zone_id = zone["zone_id"]
+
+    routing = email_routing_status(zone_id, domain)
+    if "error" in routing:
+        return {"status": "error", "domain": domain, "address": address,
+                "error": routing["error"]}
+    if not routing.get("ready"):
+        enabled = enable_email_routing(zone_id, domain)
+        if "error" in enabled:
+            return {"status": "error", "domain": domain, "address": address,
+                    "error": enabled["error"]}
+        if not enabled.get("ready"):
+            return {"status": "routing_not_ready", "domain": domain,
+                    "address": address, "zone_id": zone_id,
+                    "routing_status": enabled.get("status"),
+                    "message": enabled.get("message") or
+                               "Email Routing is not ready on %s" % domain}
+
+    if worker:
+        action = {"type": "worker", "value": [str(worker)]}
+        target = "worker:%s" % worker
+    elif forward_to:
+        dest = ensure_destination_address(forward_to)
+        if "error" in dest:
+            return {"status": "error", "domain": domain, "address": address,
+                    "error": dest["error"]}
+        if not dest.get("verified"):
+            return {"status": "pending_verification", "domain": domain,
+                    "address": address, "zone_id": zone_id,
+                    "forward_to": dest["email"],
+                    "message": ("Cloudflare will not deliver to %s until "
+                                "somebody opens that mailbox and clicks the "
+                                "verification link" % dest["email"])}
+        action = {"type": "forward", "value": [dest["email"]]}
+        target = dest["email"]
+    else:
+        return {"status": "error", "domain": domain, "address": address,
+                "error": "ensure_dev_route needs either worker= or forward_to="}
+
+    found = _rule_for_address(zone_id, domain, address)
+    if "error" in found:
+        return {"status": "error", "domain": domain, "address": address,
+                "error": found["error"]}
+    existing = found["rule"]
+
+    body = {"name": "pipeline %s" % address,
+            "enabled": True,
+            "matchers": [{"type": "literal", "field": "to", "value": address}],
+            "actions": [action]}
+
+    if existing is None:
+        call = _request("POST", "/zones/%s/email/routing/rules" % zone_id,
+                        body=body)
+        created = True
+    else:
+        # Only ever a rule whose matcher is EXACTLY our address
+        # (_rule_for_address guarantees it). A rule for any other address on
+        # this zone is never seen here and so can never be rewritten.
+        call = _request("PUT", "/zones/%s/email/routing/rules/%s"
+                        % (zone_id, existing["rule_id"]), body=body)
+        created = False
+    if not call["ok"]:
+        return {"status": "error", "domain": domain, "address": address,
+                "zone_id": zone_id,
+                "error": "Could not set the route for %s: %s"
+                         % (address, "; ".join(call["errors"])),
+                "error_codes": call["error_codes"]}
+
+    rule = call["result"] if isinstance(call["result"], dict) else {}
+    return {"status": "configured",
+            "domain": domain,
+            "address": address,
+            "developer_email": address,
+            "zone_id": zone_id,
+            "rule_id": rule.get("id") or rule.get("tag"),
+            "created": created,
+            "target": target,
+            "forward_to": forward_to if forward_to and not worker else None,
+            "worker": str(worker) if worker else None}

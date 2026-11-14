@@ -158,46 +158,95 @@ class _Pool:
         return ("owner@example.invalid", "Ada", "Byron")
 
 
-def _email_stage(cn, row, forwarding):
-    """Run the real email stage with the pool and Namecheap stubbed."""
+def _email_stage(cn, row, route, worker=""):
+    """Run the real email stage with the pool and CLOUDFLARE stubbed.
+
+    Stubs cloudflare_dns.ensure_dev_route rather than Namecheap's forwarder.
+    dev@ routing moved to Cloudflare because Namecheap's free forwarding
+    REQUIRES Namecheap DNS and so cannot survive delegating a domain - and
+    because it forwarded into the same Google account being verified, which
+    is why the codes never arrived.
+
+    `worker` sets CLOUDFLARE_EMAIL_WORKER for the duration, which is what
+    decides whether the stage asks for a Worker route or a forward.
+    """
     import email_pool
-    import namecheap_automation as nc
+    import cloudflare_dns as cf
     writes: list[dict] = []
     calls: list[tuple] = []
-    saved = (email_pool.EmailPool, nc.ensure_dev_email_forwarding,
+    saved_worker = os.environ.get("CLOUDFLARE_EMAIL_WORKER")
+    saved = (email_pool.EmailPool, cf.ensure_dev_route,
              api_v2._update_excel_row)
     try:
         email_pool.EmailPool = _Pool
         api_v2._update_excel_row = lambda c, u: writes.append(dict(u))
+        if worker:
+            os.environ["CLOUDFLARE_EMAIL_WORKER"] = worker
+        else:
+            os.environ.pop("CLOUDFLARE_EMAIL_WORKER", None)
 
-        def fake_forward(domain, forward_to):
-            calls.append((domain, forward_to))
-            return forwarding
+        def fake_route(domain, worker=None, forward_to=None, local_part="dev"):
+            calls.append((domain, worker, forward_to))
+            return route
 
-        nc.ensure_dev_email_forwarding = fake_forward
+        cf.ensure_dev_route = fake_route
         job = _run_stage(cn, "email", row)
         return job, writes, calls
     finally:
-        (email_pool.EmailPool, nc.ensure_dev_email_forwarding,
+        (email_pool.EmailPool, cf.ensure_dev_route,
          api_v2._update_excel_row) = saved
+        if saved_worker is None:
+            os.environ.pop("CLOUDFLARE_EMAIL_WORKER", None)
+        else:
+            os.environ["CLOUDFLARE_EMAIL_WORKER"] = saved_worker
 
 
 def check_forwarding_is_configured_and_recorded(r: Results) -> None:
-    print("\nemail stage: dev@ forwarding is set up and recorded")
+    print("\nemail stage: dev@ routing goes to Cloudflare and is recorded")
+    base = {"Company Name": "TEST CO LTD", "Domain": "tamu-traders.site",
+            "Assigned Email": "owner@example.invalid"}
+
     job, writes, calls = _email_stage(
-        "00000960",
-        {"Company Number": "00000960", "Company Name": "TEST CO LTD",
-         "Domain": "tamu-traders.site", "Assigned Email": "owner@example.invalid"},
-        {"status": "configured", "mailbox": "dev"})
+        "00000960", dict(base, **{"Company Number": "00000960"}),
+        {"status": "configured", "target": "owner@example.invalid",
+         "address": "dev@tamu-traders.site"})
     merged = {k: v for w in writes for k, v in w.items()}
-    r.check("Namecheap was asked to forward dev@ for the domain",
-            calls == [("tamu-traders.site", "owner@example.invalid")],
+    r.check("Cloudflare was asked to route dev@ for the domain",
+            calls == [("tamu-traders.site", None, "owner@example.invalid")],
             f"calls were {calls!r}")
     r.check("Dev Email Forwarding is recorded",
             merged.get("Dev Email Forwarding") == "configured",
-            f"writes were {writes!r} - only the batch CLI ever filled this")
+            f"writes were {writes!r}")
     r.check("the stage still reads done", job.get("status") == "done",
             f"{job.get('status')!r}")
+
+    # With a Worker configured the stage must ask for a WORKER route and must
+    # NOT also pass a forward target. Cloudflare refuses to deliver to an
+    # unverified destination, and emails.xlsx holds a different Gmail per
+    # company, so a forward costs one human verification click per company.
+    job, writes, calls = _email_stage(
+        "00000963", dict(base, **{"Company Number": "00000963"}),
+        {"status": "configured", "target": "worker:gglabs-inbound",
+         "address": "dev@tamu-traders.site"},
+        worker="gglabs-inbound")
+    r.check("with CLOUDFLARE_EMAIL_WORKER set, a Worker route is requested",
+            calls == [("tamu-traders.site", "gglabs-inbound", None)],
+            f"calls were {calls!r} - a forward target here would mean a manual "
+            f"verification step for every company")
+
+
+def check_namecheap_is_no_longer_the_dev_route(r: Results) -> None:
+    """The point of the change: Namecheap cannot serve a delegated domain."""
+    print("\nemail stage: Namecheap no longer routes dev@")
+    src = open(os.path.join(REPO, "api_v2.py"), encoding="utf-8").read()
+    stage = src[src.index('elif stage == "email":'):]
+    stage = stage[:stage.index('elif stage == "director_id":')]
+    r.check("the email stage does not call the Namecheap forwarder",
+            "ensure_dev_email_forwarding" not in stage,
+            "Namecheap's free forwarding requires Namecheap DNS, so it stops "
+            "existing the moment the domain is delegated to Cloudflare")
+    r.check("the email stage calls cloudflare_dns.ensure_dev_route",
+            "ensure_dev_route" in stage, stage[:300])
 
 
 def check_forwarding_skipped_without_a_domain(r: Results) -> None:
@@ -207,7 +256,7 @@ def check_forwarding_skipped_without_a_domain(r: Results) -> None:
         {"Company Number": "00000961", "Company Name": "TEST CO LTD"},
         {"status": "configured"})
     merged = {k: v for w in writes for k, v in w.items()}
-    r.check("Namecheap was not called", calls == [], f"calls were {calls!r}")
+    r.check("Cloudflare was not called", calls == [], f"calls were {calls!r}")
     r.check("nothing was written for forwarding",
             "Dev Email Forwarding" not in merged, f"writes were {writes!r}")
     r.check("the email was still assigned",
@@ -217,23 +266,49 @@ def check_forwarding_skipped_without_a_domain(r: Results) -> None:
 
 
 def check_forwarding_failure_is_not_silent(r: Results) -> None:
-    """A dev@ address is a blocking Play Console check, so a forward that did
-    not happen must not read as a finished stage."""
-    print("\nemail stage: a forwarding failure fails the stage")
-    job, writes, calls = _email_stage(
-        "00000962",
-        {"Company Number": "00000962", "Company Name": "TEST CO LTD",
-         "Domain": "tamu-traders.site", "Assigned Email": "owner@example.invalid"},
-        {"status": "error", "error": "Namecheap said no"})
-    merged = {k: v for w in writes for k, v in w.items()}
-    r.check("the job is failed", job.get("status") == "failed",
-            f"status was {job.get('status')!r}")
-    r.check("the reason reaches the operator",
-            "Namecheap said no" in str(job.get("error") or ""),
-            f"error was {job.get('error')!r}")
-    r.check("the failure is recorded on the row",
-            "error" in str(merged.get("Dev Email Forwarding") or ""),
-            f"writes were {writes!r}")
+    """A dev@ address is a blocking Play Console check, so a route that did
+    not happen must not read as a finished stage.
+
+    ensure_dev_route has FOUR ways of not working, and each one is a
+    different operator action: a Cloudflare outage, a domain nobody has
+    delegated yet, a forward target nobody has verified, and Email Routing
+    that is on but not ready. Every one of them has to fail the stage and
+    carry its own reason - the whole family of defects this codebase has
+    been working through is a thing that did not happen looking like a
+    thing that did.
+    """
+    print("\nemail stage: every way routing can fail, fails the stage")
+    cases = [
+        ({"status": "error", "error": "Cloudflare said no"},
+         "Cloudflare said no"),
+        ({"status": "not_delegated",
+          "message": "tamu-traders.site has no zone in this Cloudflare account"},
+         "no zone in this Cloudflare account"),
+        ({"status": "pending_verification",
+          "message": "somebody must click the verification link"},
+         "verification link"),
+        ({"status": "routing_not_ready",
+          "message": "Email Routing is not ready on tamu-traders.site"},
+         "not ready"),
+    ]
+    for i, (route, needle) in enumerate(cases):
+        cn = "0000097%d" % i
+        status = route["status"]
+        job, writes, _calls = _email_stage(
+            cn,
+            {"Company Number": cn, "Company Name": "TEST CO LTD",
+             "Domain": "tamu-traders.site",
+             "Assigned Email": "owner@example.invalid"},
+            route)
+        merged = {k: v for w in writes for k, v in w.items()}
+        r.check(f"{status} fails the stage", job.get("status") == "failed",
+                f"status was {job.get('status')!r} for {status}")
+        r.check(f"...{status} reason reaches the operator",
+                needle in str(job.get("error") or ""),
+                f"error was {job.get('error')!r}")
+        r.check(f"...{status} is recorded on the row",
+                merged.get("Dev Email Forwarding") == status,
+                f"writes were {writes!r}")
 
 
 # ── the DUNS store finally talks to the company row ────────────────────────
@@ -318,6 +393,7 @@ def main() -> int:
     check_absent_dnb_fields_are_not_blanked(r)
     check_dead_temp_email_branch_is_gone(r)
     check_forwarding_is_configured_and_recorded(r)
+    check_namecheap_is_no_longer_the_dev_route(r)
     check_forwarding_skipped_without_a_domain(r)
     check_forwarding_failure_is_not_silent(r)
     check_duns_store_syncs_to_the_row(r)

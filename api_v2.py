@@ -732,24 +732,50 @@ def _exec_stage(cn: str, stage: str, row: dict):
             print("  email: no domain yet, so dev@ forwarding was not attempted")
             return {"email": email, "status": assigned}
 
-        from namecheap_automation import ensure_dev_email_forwarding
-        fwd = ensure_dev_email_forwarding(domain, email)
-        fwd_status = str(fwd.get("status") or "unknown")
-        _update_excel_row(cn, {"Dev Email Forwarding": fwd_status})
-        print(f"  email: dev@{domain} -> {email} ({fwd_status})")
-        if fwd_status != "configured":
-            # Not a footnote: without this forward the company cannot pass
-            # Play Console review, so the stage has not finished its job.
-            # Re-running is safe - assigning an email is idempotent.
+        # dev@<domain> is routed by CLOUDFLARE now, not Namecheap.
+        #
+        # Namecheap's free forwarding REQUIRES Namecheap DNS, so it cannot
+        # survive the delegation this pipeline performs: the moment a
+        # domain's nameservers point at Cloudflare the forward stops
+        # existing. It was also the reason Google's verification codes never
+        # arrived - it forwarded dev@ into the very Google account being
+        # verified, and Google discards mail it decides was sent and received
+        # by the same account.
+        #
+        # A Worker is preferred over a forward and the difference is not
+        # cosmetic. Cloudflare refuses to deliver to a destination address
+        # nobody has verified, and verification means a human opening THAT
+        # mailbox and clicking a link. emails.xlsx holds a different Gmail
+        # per company, so a forward-based route costs one manual step per
+        # company - exactly what this pipeline exists to avoid. A Worker
+        # needs no verification at all.
+        import cloudflare_dns
+        worker = os.getenv("CLOUDFLARE_EMAIL_WORKER", "").strip()
+        route = cloudflare_dns.ensure_dev_route(
+            domain,
+            worker=worker or None,
+            forward_to=None if worker else email,
+        )
+        route_status = str(route.get("status") or "unknown")
+        _update_excel_row(cn, {"Dev Email Forwarding": route_status})
+        print(f"  email: dev@{domain} -> {route.get('target') or '(no target)'} "
+              f"({route_status})")
+        if route_status != "configured":
+            # Not a footnote: without a working dev@ route the company cannot
+            # pass Play Console review and cannot receive Google's code, so
+            # the stage has not finished its job. Re-running is safe -
+            # assigning an email and setting a route are both idempotent.
             return {
                 "status": "error",
                 "email": email,
                 "error": (f"the email {email} is assigned, but dev@{domain} "
-                          f"forwarding is {fwd_status}: "
-                          f"{fwd.get('error') or 'no reason given'}"),
+                          f"routing is {route_status}: "
+                          f"{route.get('message') or route.get('error') or 'no reason given'}"),
             }
         return {"email": email, "status": assigned,
-                "dev_email_forwarding": fwd_status}
+                "dev_email_forwarding": route_status,
+                "developer_email": route.get("address"),
+                "route_target": route.get("target")}
 
     elif stage == "director_id":
         _clean_stage_output(cn, name, "director_id")

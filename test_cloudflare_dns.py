@@ -712,6 +712,210 @@ def check_txt_record_shape(r: Results) -> None:
             sent.get("ttl") == 1, repr(sent))
 
 
+# ============================================================
+# EMAIL ROUTING: the Namecheap replacement
+# ============================================================
+
+def _routing_routes(zone_id=ZONE_ID, domain="simon-mwangi.site",
+                    routing_status="ready", rules=None, addresses=None):
+    """The GET surface ensure_dev_route reads before it writes anything."""
+    return {
+        "GET /zones": (200, envelope([zone_fixture(domain=domain,
+                                                   zone_id=zone_id)])),
+        "GET /zones/%s" % zone_id: (200, envelope(zone_fixture(domain=domain,
+                                                               zone_id=zone_id))),
+        "GET /zones/%s/email/routing" % zone_id: (200, envelope(
+            {"id": "er1", "enabled": True, "status": routing_status})),
+        "GET /zones/%s/email/routing/rules" % zone_id: (200, envelope(rules or [])),
+        "GET /accounts/%s/email/routing/addresses" % ACCOUNT_ID:
+            (200, envelope(addresses if addresses is not None else [])),
+    }
+
+
+def check_route_tells_undelegated_from_unreachable(r: Results) -> None:
+    print("\nrouting: 'not delegated yet' and 'could not ask' are different")
+
+    # Cloudflare answered: there is no such zone. Normal, not an error.
+    fake = with_http({"GET /zones": (200, envelope([]))})
+    out = cf.ensure_dev_route("simon-mwangi.site", worker="w")
+    r.check("an undelegated domain reports not_delegated",
+            out.get("status") == "not_delegated", repr(out))
+    r.check("...and is NOT an error", "error" not in out, repr(out))
+    r.check("...and names the domain in the message",
+            "simon-mwangi.site" in str(out.get("message", "")), repr(out))
+    r.check("...and wrote nothing",
+            all(c["method"] == "GET" for c in fake.calls), repr(fake.keys()))
+
+    # Cloudflare did NOT answer. Must not look like 'not delegated', which
+    # would send the caller off to create a zone during an outage.
+    fake = with_http({"GET /zones": Boom("timeout")})
+    out = cf.ensure_dev_route("simon-mwangi.site", worker="w")
+    r.check("an outage reports error", out.get("status") == "error", repr(out))
+    r.check("...and NOT not_delegated",
+            out.get("status") != "not_delegated", repr(out))
+
+
+def check_route_requires_a_destination(r: Results) -> None:
+    print("\nrouting: a route with no destination is refused")
+    fake = with_http(_routing_routes())
+    out = cf.ensure_dev_route("simon-mwangi.site")
+    r.check("neither worker nor forward_to is an error",
+            out.get("status") == "error", repr(out))
+    r.check("...and no rule was written",
+            fake.count("POST /zones/%s/email/routing/rules" % ZONE_ID) == 0,
+            repr(fake.keys()))
+
+
+def check_worker_route_is_created(r: Results) -> None:
+    print("\nrouting: a Worker route needs no destination verification")
+    routes = _routing_routes()
+    routes["POST /zones/%s/email/routing/rules" % ZONE_ID] = (200, envelope(
+        {"id": "rule1", "enabled": True}))
+    fake = with_http(routes)
+    out = cf.ensure_dev_route("simon-mwangi.site", worker="gglabs-inbound")
+    r.check("the route is configured", out.get("status") == "configured",
+            repr(out))
+    r.check("...the address is dev@domain",
+            out.get("address") == "dev@simon-mwangi.site", repr(out))
+    r.check("...and it was created, not updated", out.get("created") is True,
+            repr(out))
+    sent = [c["json"] for c in fake.calls
+            if c["key"] == "POST /zones/%s/email/routing/rules" % ZONE_ID]
+    r.check("the action type is worker",
+            sent and sent[0]["actions"] == [{"type": "worker",
+                                             "value": ["gglabs-inbound"]}],
+            f"sent {sent!r}")
+    r.check("the matcher is a literal on the exact address",
+            sent and sent[0]["matchers"] == [
+                {"type": "literal", "field": "to",
+                 "value": "dev@simon-mwangi.site"}], f"sent {sent!r}")
+    r.check("no destination address was created for a Worker route",
+            fake.count("POST /accounts") == 0,
+            "a Worker needs no verified destination; creating one would add "
+            "a human click per company for nothing")
+
+
+def check_forward_route_refuses_an_unverified_destination(r: Results) -> None:
+    print("\nrouting: Cloudflare will not deliver to an unverified address")
+    # Nothing registered yet -> it gets created, and a fresh one is unverified.
+    routes = _routing_routes(addresses=[])
+    routes["POST /accounts/%s/email/routing/addresses" % ACCOUNT_ID] = (
+        200, envelope({"id": "d1", "email": "owner@example.invalid",
+                       "verified": None}))
+    fake = with_http(routes)
+    out = cf.ensure_dev_route("simon-mwangi.site",
+                              forward_to="owner@example.invalid")
+    r.check("an unverified destination is pending_verification",
+            out.get("status") == "pending_verification", repr(out))
+    r.check("...and says a human must click in that mailbox",
+            "click" in str(out.get("message", "")).lower(), repr(out))
+    r.check("...and NO routing rule was written",
+            fake.count("POST /zones/%s/email/routing/rules" % ZONE_ID) == 0,
+            "a rule pointing at an unverified address silently drops mail")
+
+    # Already registered and verified -> the route goes in.
+    routes = _routing_routes(addresses=[
+        {"id": "d1", "email": "owner@example.invalid",
+         "verified": "2026-01-01T00:00:00Z"}])
+    routes["POST /zones/%s/email/routing/rules" % ZONE_ID] = (200, envelope(
+        {"id": "rule2"}))
+    fake = with_http(routes)
+    out = cf.ensure_dev_route("simon-mwangi.site",
+                              forward_to="owner@example.invalid")
+    r.check("a verified destination is configured",
+            out.get("status") == "configured", repr(out))
+    sent = [c["json"] for c in fake.calls
+            if c["key"] == "POST /zones/%s/email/routing/rules" % ZONE_ID]
+    r.check("...with a forward action",
+            sent and sent[0]["actions"][0]["type"] == "forward", f"{sent!r}")
+    r.check("...and no duplicate destination was created",
+            fake.count("POST /accounts") == 0, repr(fake.keys()))
+
+
+def check_route_is_idempotent_and_touches_only_its_own_rule(r: Results) -> None:
+    print("\nrouting: re-running updates OUR rule and never anyone else's")
+    mine = {"id": "mine", "name": "pipeline dev@simon-mwangi.site",
+            "enabled": True,
+            "matchers": [{"type": "literal", "field": "to",
+                          "value": "dev@simon-mwangi.site"}],
+            "actions": [{"type": "worker", "value": ["old-worker"]}]}
+    someone_else = {"id": "theirs", "name": "support", "enabled": True,
+                    "matchers": [{"type": "literal", "field": "to",
+                                  "value": "support@simon-mwangi.site"}],
+                    "actions": [{"type": "forward", "value": ["x@y.invalid"]}]}
+    catch_all = {"id": "catchall", "name": "catch all", "enabled": True,
+                 "matchers": [{"type": "all"}],
+                 "actions": [{"type": "drop"}]}
+
+    routes = _routing_routes(rules=[someone_else, catch_all, mine])
+    routes["PUT /zones/%s/email/routing/rules/mine" % ZONE_ID] = (
+        200, envelope({"id": "mine"}))
+    fake = with_http(routes)
+    out = cf.ensure_dev_route("simon-mwangi.site", worker="gglabs-inbound")
+    r.check("an existing dev@ rule is updated", out.get("status") == "configured",
+            repr(out))
+    r.check("...reported as not created", out.get("created") is False, repr(out))
+    r.check("...by PUT on that rule id",
+            fake.count("PUT /zones/%s/email/routing/rules/mine" % ZONE_ID) == 1,
+            repr(fake.keys()))
+    r.check("...and no second rule was POSTed",
+            fake.count("POST /zones/%s/email/routing/rules" % ZONE_ID) == 0,
+            repr(fake.keys()))
+    touched = [c["key"] for c in fake.calls if c["method"] in ("PUT", "PATCH",
+                                                               "DELETE")]
+    r.check("the other address's rule is never written",
+            not any("theirs" in k for k in touched), repr(touched))
+    r.check("the catch-all is never written",
+            not any("catchall" in k for k in touched), repr(touched))
+
+
+def check_routing_not_ready_is_not_configured(r: Results) -> None:
+    print("\nrouting: Email Routing that is not ready is not a working route")
+    routes = _routing_routes(routing_status="misconfigured")
+    routes["POST /zones/%s/email/routing/dns" % ZONE_ID] = (200, envelope(
+        {"id": "er1", "enabled": True, "status": "misconfigured"}))
+    fake = with_http(routes)
+    out = cf.ensure_dev_route("simon-mwangi.site", worker="w")
+    r.check("it tries to enable routing first",
+            fake.count("POST /zones/%s/email/routing/dns" % ZONE_ID) == 1,
+            repr(fake.keys()))
+    r.check("a zone that stays unready reports routing_not_ready",
+            out.get("status") == "routing_not_ready", repr(out))
+    r.check("...and is NOT configured", out.get("status") != "configured",
+            repr(out))
+    r.check("...and writes no rule",
+            fake.count("POST /zones/%s/email/routing/rules" % ZONE_ID) == 0,
+            repr(fake.keys()))
+
+
+def check_destination_address_verification_is_reported(r: Results) -> None:
+    print("\nrouting: a destination address reports its real verified state")
+    fake = with_http({"GET /accounts/%s/email/routing/addresses" % ACCOUNT_ID:
+                      (200, envelope([
+                          {"id": "d1", "email": "Owner@Example.Invalid",
+                           "verified": "2026-01-01T00:00:00Z"},
+                          {"id": "d2", "email": "new@example.invalid",
+                           "verified": None}]))})
+    out = cf.list_destination_addresses()
+    r.check("a verified timestamp reads as verified True",
+            out["addresses"][0]["verified"] is True, repr(out))
+    r.check("a null verified reads as False",
+            out["addresses"][1]["verified"] is False, repr(out))
+    r.check("addresses are lowercased for comparison",
+            out["addresses"][0]["email"] == "owner@example.invalid", repr(out))
+
+    fake = with_http({"GET /accounts/%s/email/routing/addresses" % ACCOUNT_ID:
+                      (200, envelope([{"id": "d1",
+                                       "email": "owner@example.invalid",
+                                       "verified": "2026-01-01T00:00:00Z"}]))})
+    out = cf.ensure_destination_address("OWNER@example.invalid")
+    r.check("an existing address is found, not re-created",
+            out.get("created") is False and out.get("verified") is True,
+            repr(out))
+    r.check("...and nothing was POSTed", fake.count("POST") == 0,
+            repr(fake.keys()))
+
+
 def main() -> int:
     print("test_cloudflare_dns.py — the four ways delegation could silently "
           "not work")
@@ -731,6 +935,13 @@ def main() -> int:
         check_find_zone_keeps_three_outcomes_apart(r)
         check_create_zone_idempotency(r)
         check_txt_record_shape(r)
+        check_route_tells_undelegated_from_unreachable(r)
+        check_route_requires_a_destination(r)
+        check_worker_route_is_created(r)
+        check_forward_route_refuses_an_unverified_destination(r)
+        check_route_is_idempotent_and_touches_only_its_own_rule(r)
+        check_routing_not_ready_is_not_configured(r)
+        check_destination_address_verification_is_reported(r)
     finally:
         cf.requests = saved_requests
         os.environ.pop("CLOUDFLARE_API_TOKEN", None)
