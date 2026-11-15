@@ -936,3 +936,143 @@ def enable_privacy(domain_name):
     if resp["status"] != "OK":
         return {"error": f"Failed: {resp['errors']}"}
     return {"success": True, "domain": domain_name}
+
+
+# ============================================================
+# DELEGATION — the one DNS-adjacent thing that must stay here
+# ============================================================
+
+def get_nameservers(domain_name):
+    """The nameservers the REGISTRAR currently has for a domain.
+
+    This is the authority on where a domain is delegated. Public DNS can be
+    stale for up to the TTL, and Cloudflare's view of "original_name_servers"
+    is a snapshot from when its zone was created.
+    """
+    sld, tld = _split_domain(domain_name)
+    if not sld or not tld:
+        return {"error": f"Could not parse domain: {domain_name}"}
+    resp = _api_call("domains.dns.getList", {"SLD": sld, "TLD": tld})
+    if resp["status"] != "OK":
+        return {"error": f"Failed to read nameservers: {resp['errors']}",
+                "error_numbers": resp.get("error_numbers", [])}
+
+    using_registrar_dns = None
+    servers = []
+    for node in resp["root"].iter():
+        name = _node_name(node)
+        if name == "DomainDNSGetListResult":
+            flag = node.attrib.get("IsUsingOurDNS")
+            if flag is not None:
+                using_registrar_dns = str(flag).strip().lower() == "true"
+        elif name == "Nameserver" and (node.text or "").strip():
+            servers.append((node.text or "").strip().rstrip(".").lower())
+    return {"domain": domain_name, "nameservers": servers,
+            "using_registrar_dns": using_registrar_dns}
+
+
+# namecheap.domains.dns.setCustom's parameter encoding could NOT be confirmed
+# from Namecheap's own documentation: www.namecheap.com serves this
+# environment a bot challenge on every path, so the page was never read.
+# Secondary sources disagree - a search summary of the official page says a
+# single comma-separated "NameServers", while at least one real client sends
+# numbered Nameserver1/Nameserver2.
+#
+# Guessing on a live domain is not acceptable: the failure mode is a domain
+# delegated to nothing, which is an outage with no error message. So both
+# encodings are tried IN ORDER and the result is VERIFIED BY READING BACK,
+# never by trusting the response. Whichever form the registrar actually
+# honours is the one that survives the read.
+_SETCUSTOM_ENCODINGS = (
+    ("NameServers", lambda hosts: {"NameServers": ",".join(hosts)}),
+    ("Nameserver1..N", lambda hosts: {f"Nameserver{i}": h
+                                      for i, h in enumerate(hosts, 1)}),
+)
+
+
+def set_custom_dns(domain_name, nameservers):
+    """Delegate `domain_name` to `nameservers` at the registrar.
+
+    THE DANGEROUS CALL IN THIS MODULE. A domain whose nameservers are wrong
+    or empty stops resolving, and nothing bounces to say so.
+
+    Three protections, in order:
+
+      1. The current nameservers are read FIRST and kept as a rollback
+         target. If the domain ends up delegated to neither the requested
+         set nor its original one, this restores the original before
+         returning.
+      2. The requested set is validated: at least two distinct non-empty
+         hostnames. Namecheap will accept fewer and the registry will not.
+      3. Success is decided by READING THE NAMESERVERS BACK, not by the
+         API's own Updated flag. An encoding the provider silently ignores
+         would otherwise report success having changed nothing.
+
+    Returns {"updated": True, "nameservers": [...], "encoding": "<which
+    parameter form worked>", "previous": [...]} or {"error": ...}.
+    """
+    sld, tld = _split_domain(domain_name)
+    if not sld or not tld:
+        return {"error": f"Could not parse domain: {domain_name}"}
+
+    hosts, seen = [], set()
+    for raw in nameservers or []:
+        host = str(raw or "").strip().rstrip(".").lower()
+        if host and host not in seen:
+            seen.add(host)
+            hosts.append(host)
+    if len(hosts) < 2:
+        return {"error": f"refusing to delegate {domain_name} to "
+                         f"{len(hosts)} nameserver(s): {nameservers!r}"}
+
+    before = get_nameservers(domain_name)
+    if "error" in before:
+        return {"error": f"refusing to change nameservers for {domain_name}: "
+                         f"could not read the current ones first "
+                         f"({before['error']})"}
+    previous = before["nameservers"]
+    if [h for h in previous] == hosts:
+        return {"updated": False, "already": True, "nameservers": hosts,
+                "previous": previous, "domain": domain_name,
+                "encoding": "unchanged"}
+
+    attempts = []
+    for label, build in _SETCUSTOM_ENCODINGS:
+        params = {"SLD": sld, "TLD": tld}
+        params.update(build(hosts))
+        resp = _api_call("domains.dns.setCustom", params, method="POST")
+        attempts.append({"encoding": label, "status": resp["status"],
+                         "errors": resp["errors"]})
+
+        after = get_nameservers(domain_name)
+        if "error" in after:
+            # We cannot see what we just did. Do not try another encoding on
+            # top of an unknown state.
+            return {"error": f"set nameservers for {domain_name} with the "
+                             f"{label} form but could not read them back: "
+                             f"{after['error']}",
+                    "attempts": attempts, "previous": previous,
+                    "state": "unknown"}
+        current = after["nameservers"]
+        if current == hosts:
+            return {"updated": True, "domain": domain_name,
+                    "nameservers": current, "previous": previous,
+                    "encoding": label, "attempts": attempts}
+        if current and current != previous:
+            # Neither what we asked for nor what was there. Put it back.
+            restore = {"SLD": sld, "TLD": tld}
+            restore.update(build(previous))
+            _api_call("domains.dns.setCustom", restore, method="POST")
+            restored = get_nameservers(domain_name)
+            return {"error": f"{domain_name} ended up on {current!r}, which is "
+                             f"neither the requested {hosts!r} nor the "
+                             f"original {previous!r}; attempted to restore",
+                    "attempts": attempts, "previous": previous,
+                    "restored_to": restored.get("nameservers"),
+                    "state": "restored" if restored.get("nameservers") == previous
+                             else "INCONSISTENT"}
+        # current == previous: this encoding did nothing. Try the next one.
+
+    return {"error": f"neither parameter encoding changed the nameservers for "
+                     f"{domain_name}; it is still on {previous!r}",
+            "attempts": attempts, "previous": previous, "state": "unchanged"}

@@ -19,6 +19,7 @@ HERMETIC_TESTS := \
 	test_build_source.py \
 	test_check_stage.py \
 	test_cloudflare_dns.py \
+	test_delegation.py \
 	test_deploy_scripts.py \
 	test_email_stage.py \
 	test_flavor_regen.py \
