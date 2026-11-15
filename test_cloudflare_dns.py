@@ -916,6 +916,145 @@ def check_destination_address_verification_is_reported(r: Results) -> None:
             repr(fake.keys()))
 
 
+# ============================================================
+# GOOGLE TXT ON CLOUDFLARE, and the dry run
+# ============================================================
+
+def check_google_txt_token_pending(r: Results) -> None:
+    print("\ngoogle txt: no token means no DNS change at all")
+    for blank in ["", "   ", None]:
+        fake = with_http({})
+        out = cf.ensure_google_txt_record("simon-mwangi.site", txt_value=blank)
+        r.check(f"token {blank!r} reports token_pending",
+                out.get("status") == "token_pending", repr(out))
+        r.check(f"...and contacts Cloudflare not at all for {blank!r}",
+                fake.calls == [], repr(fake.keys()))
+
+
+def check_google_txt_undelegated_vs_unreachable(r: Results) -> None:
+    print("\ngoogle txt: 'not delegated' and 'could not ask' stay apart")
+    fake = with_http({"GET /zones": (200, envelope([]))})
+    out = cf.ensure_google_txt_record("simon-mwangi.site", txt_value="tok")
+    r.check("an undelegated domain reports not_delegated",
+            out.get("status") == "not_delegated", repr(out))
+    r.check("...and is not an error", "error" not in out, repr(out))
+
+    fake = with_http({"GET /zones": Boom("timeout")})
+    out = cf.ensure_google_txt_record("simon-mwangi.site", txt_value="tok")
+    r.check("an outage reports error", out.get("status") == "error", repr(out))
+    r.check("...and NOT not_delegated", out.get("status") != "not_delegated",
+            repr(out))
+
+
+def check_google_txt_writes_and_is_idempotent(r: Results) -> None:
+    print("\ngoogle txt: written once, and not duplicated on a re-run")
+    domain = "simon-mwangi.site"
+    token = "google-site-verification=abc123"
+    base = {
+        "GET /zones": (200, envelope([zone_fixture()])),
+        "GET /zones/%s" % ZONE_ID: (200, envelope(zone_fixture())),
+    }
+
+    # Nothing there yet -> created.
+    routes = dict(base)
+    routes["GET /zones/%s/dns_records" % ZONE_ID] = (200, envelope([]))
+    routes["POST /zones/%s/dns_records" % ZONE_ID] = (200, envelope(
+        {"id": "rec9", "name": domain, "content": token, "ttl": 1}))
+    fake = with_http(routes)
+    out = cf.ensure_google_txt_record(domain, txt_value=token)
+    r.check("a fresh record is configured", out.get("status") == "configured",
+            repr(out))
+    r.check("...and reported as created", out.get("created") is True, repr(out))
+    sent = [c["json"] for c in fake.calls if c["method"] == "POST"]
+    r.check("...with the token as the content",
+            sent and sent[0].get("content") == token, f"sent {sent!r}")
+    r.check("...at the zone apex for hostname '@'",
+            sent and sent[0].get("name") == domain, f"sent {sent!r}")
+
+    # Already present with the same content -> no second write.
+    routes = dict(base)
+    routes["GET /zones/%s/dns_records" % ZONE_ID] = (200, envelope(
+        [{"id": "rec9", "name": domain, "content": token, "ttl": 1}]))
+    fake = with_http(routes)
+    out = cf.ensure_google_txt_record(domain, txt_value=token)
+    r.check("an identical record is left alone",
+            out.get("status") == "configured" and out.get("created") is False,
+            repr(out))
+    r.check("...and nothing is POSTed", fake.count("POST") == 0,
+            "a re-run would otherwise add a duplicate TXT every time")
+
+    # Cloudflare may hand the content back quoted.
+    routes = dict(base)
+    routes["GET /zones/%s/dns_records" % ZONE_ID] = (200, envelope(
+        [{"id": "rec9", "name": domain, "content": '"%s"' % token, "ttl": 1}]))
+    fake = with_http(routes)
+    out = cf.ensure_google_txt_record(domain, txt_value=token)
+    r.check("a quoted existing value still counts as a match",
+            out.get("created") is False, repr(out))
+    r.check("...and still writes nothing", fake.count("POST") == 0,
+            repr(fake.keys()))
+
+    # A DIFFERENT token must be written, not skipped.
+    routes = dict(base)
+    routes["GET /zones/%s/dns_records" % ZONE_ID] = (200, envelope(
+        [{"id": "rec9", "name": domain, "content": "an-older-token", "ttl": 1}]))
+    routes["POST /zones/%s/dns_records" % ZONE_ID] = (200, envelope(
+        {"id": "rec10", "name": domain, "content": token}))
+    fake = with_http(routes)
+    out = cf.ensure_google_txt_record(domain, txt_value=token)
+    r.check("a new token IS written", out.get("created") is True, repr(out))
+
+    # A sub-host is qualified against the zone.
+    routes = dict(base)
+    routes["GET /zones/%s/dns_records" % ZONE_ID] = (200, envelope([]))
+    routes["POST /zones/%s/dns_records" % ZONE_ID] = (200, envelope(
+        {"id": "r", "name": "_google." + domain, "content": token}))
+    fake = with_http(routes)
+    cf.ensure_google_txt_record(domain, txt_value=token, hostname="_google")
+    sent = [c["json"] for c in fake.calls if c["method"] == "POST"]
+    r.check("a sub-host becomes <host>.<domain>",
+            sent and sent[0].get("name") == "_google." + domain,
+            f"sent {sent!r}")
+
+
+def check_dry_run_writes_nothing(r: Results) -> None:
+    print("\ndry run: every read happens, no write does")
+    routes = _routing_routes()
+    fake = with_http(routes)
+    out = cf.ensure_dev_route("simon-mwangi.site", worker="w", dry_run=True)
+    r.check("the status is dry_run, never 'configured'",
+            out.get("status") == "dry_run", repr(out))
+    r.check("...and it says it would create", out.get("would") == "create",
+            repr(out))
+    writes = [c["key"] for c in fake.calls
+              if c["method"] in ("POST", "PUT", "PATCH", "DELETE")]
+    r.check("...and NOTHING was written", writes == [], repr(writes))
+
+    # With a rule already there it would UPDATE.
+    mine = {"id": "mine", "enabled": True,
+            "matchers": [{"type": "literal", "field": "to",
+                          "value": "dev@simon-mwangi.site"}],
+            "actions": [{"type": "worker", "value": ["old"]}]}
+    fake = with_http(_routing_routes(rules=[mine]))
+    out = cf.ensure_dev_route("simon-mwangi.site", worker="w", dry_run=True)
+    r.check("an existing rule means it would update",
+            out.get("would") == "update", repr(out))
+    r.check("...naming the rule it would touch", out.get("rule_id") == "mine",
+            repr(out))
+
+    # A dry run must not REGISTER a destination address either: registering
+    # one sends a verification mail, which is a side effect on a real person.
+    fake = with_http(_routing_routes(addresses=[]))
+    out = cf.ensure_dev_route("simon-mwangi.site",
+                              forward_to="nobody@example.invalid",
+                              dry_run=True)
+    r.check("an unknown forward target is still pending_verification",
+            out.get("status") == "pending_verification", repr(out))
+    r.check("...and no destination address was registered",
+            fake.count("POST /accounts") == 0,
+            "registering one sends a verification email - a real side effect")
+
+
 def main() -> int:
     print("test_cloudflare_dns.py — the four ways delegation could silently "
           "not work")
@@ -942,6 +1081,10 @@ def main() -> int:
         check_route_is_idempotent_and_touches_only_its_own_rule(r)
         check_routing_not_ready_is_not_configured(r)
         check_destination_address_verification_is_reported(r)
+        check_google_txt_token_pending(r)
+        check_google_txt_undelegated_vs_unreachable(r)
+        check_google_txt_writes_and_is_idempotent(r)
+        check_dry_run_writes_nothing(r)
     finally:
         cf.requests = saved_requests
         os.environ.pop("CLOUDFLARE_API_TOKEN", None)

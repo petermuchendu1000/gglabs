@@ -1,25 +1,43 @@
 #!/usr/bin/env python3
-"""Tests for stage 3, dev@ email forwarding (pipeline.py:179-258).
+"""Tests for stage 3, dev@ email routing (pipeline.stage_email).
 
     python3 test_email_stage.py
 
-Hermetic: no network, no database, no Namecheap account, and no writes
+Hermetic: no network, no database, no Cloudflare account, and no writes
 inside the repository - BASE_DIR is redirected to a temporary directory for
-the manifest checks. stage_email imports requests inside its own body
-(pipeline.py:181) so patching the module's `get` is enough, and db is a
-module-scope import (pipeline.py:30) so pipeline.db is replaceable. No
-production code was changed to make this testable.
+the manifest checks. The double replaces cloudflare_dns.ensure_dev_route,
+and pipeline.db is a module-scope import so it is replaceable. No production
+code was changed to make this testable.
 
-This stage mutates live email routing for a real domain. It does not spend
+This stage mutates live mail routing for a real domain. It does not spend
 money, but a wrong write silently redirects or destroys a customer's mail,
-so the checks that matter most are: dry_run issues no setEmailForwarding
-call at all, and an existing forward is never dropped from the set call.
+so the check that matters most is still that dry_run issues no write.
 
-Namecheap's setEmailForwarding REPLACES the whole forwarding set - the code
-re-submits `existing + [("dev", ...)]` at pipeline.py:230-237 - so anything
-missing from `existing` is deleted. pipeline.py:225 filters to entries where
-BOTH mailbox and target are non-empty, which is where FINDING 1 below comes
-from.
+WHAT CHANGED, AND WHY TWO CHECKS WERE REMOVED
+---------------------------------------------
+This stage used to drive Namecheap directly with ~80 lines of inline XML.
+Namecheap's setEmailForwarding REPLACES the whole forwarding set, so the
+code had to read every existing forward back and re-submit it, and anything
+missing from that read was DELETED. Two checks existed solely to guard that
+hazard:
+
+    check_preserves_existing       an existing forward is never dropped
+    check_malformed_forward_refused  a set with a blank mailbox or target is
+                                   refused rather than rewritten
+
+Cloudflare creates routing rules INDIVIDUALLY. There is no set to read, no
+merge, and ensure_dev_route only ever matches a rule whose matcher is
+exactly dev@<this domain>, so it cannot remove or rewrite a rule it did not
+create. The operation those two checks guarded no longer exists, so the
+checks were removed rather than rewritten into something vacuous.
+
+They are replaced by check_the_merge_hazard_is_gone, which asserts the
+absence directly: the stage makes exactly ONE provider call per company and
+its source contains no read-modify-write of a forwarding set.
+
+Namecheap is NOT gone from the pipeline. It remains the registrar - it
+checks availability, buys the domain and sets its nameservers. It no longer
+touches records or mail.
 """
 from __future__ import annotations
 
@@ -43,12 +61,8 @@ os.environ.setdefault("NAMECHEAP_CLIENT_IP", "127.0.0.1")
 os.environ.setdefault("DATABASE_URL", "postgresql://unused@127.0.0.1:1/none")
 os.environ.setdefault("LOG_LEVEL", "CRITICAL")
 
-import requests
+import cloudflare_dns
 import pipeline
-
-U = "http://api.namecheap.com/xml.response"
-GET_CMD = "namecheap.domains.dns.getEmailForwarding"
-SET_CMD = "namecheap.domains.dns.setEmailForwarding"
 
 
 class Results:
@@ -73,52 +87,37 @@ class Results:
         return 1 if self.failed else 0
 
 
-def forwarding_xml(*pairs: tuple[str, str]) -> str:
-    fws = "".join(f'<Forward mailbox="{m}">{t}</Forward>' for m, t in pairs)
-    return (f'<ApiResponse Status="OK" xmlns="{U}"><CommandResponse>'
-            f'<DomainDNSGetEmailForwardingResult>{fws}'
-            '</DomainDNSGetEmailForwardingResult>'
-            '</CommandResponse></ApiResponse>')
+def route(status="configured", created=True, target="owner@real.example",
+          **extra):
+    """Build one ensure_dev_route return value."""
+    out = {"status": status, "target": target}
+    if status == "configured":
+        out["created"] = created
+    out.update(extra)
+    return out
 
 
-def error_xml(*messages: str) -> str:
-    errs = "".join(f'<Error Number="1">{m}</Error>' for m in messages)
-    return (f'<ApiResponse Status="ERROR" xmlns="{U}">'
-            f'<Errors>{errs}</Errors></ApiResponse>')
+class _Routes:
+    """Records every ensure_dev_route call and answers from a script."""
 
+    def __init__(self, result=None, per_domain=None):
+        self.result = result
+        self.per_domain = per_domain or {}
+        self.calls: list[dict] = []
 
-OK_SET = f'<ApiResponse Status="OK" xmlns="{U}"><CommandResponse/></ApiResponse>'
-
-
-class _Calls:
-    """Records every requests.get and answers by Command."""
-
-    def __init__(self, get_body: str, set_body: str = OK_SET,
-                 get_raises: Exception | None = None):
-        self.get_body = get_body
-        self.set_body = set_body
-        self.get_raises = get_raises
-        self.calls: list[tuple[str, dict]] = []
-
-    def __call__(self, url, params=None, **kw):
-        params = params or {}
-        cmd = params.get("Command", "")
-        self.calls.append((cmd, dict(params)))
-        if cmd == GET_CMD and self.get_raises is not None:
-            raise self.get_raises
-        body = self.set_body if cmd == SET_CMD else self.get_body
-
-        class _R:
-            text = body
-        return _R()
-
-    @property
-    def sets(self):
-        return [p for c, p in self.calls if c == SET_CMD]
-
-    @property
-    def gets(self):
-        return [p for c, p in self.calls if c == GET_CMD]
+    def __call__(self, domain, worker=None, forward_to=None,
+                 local_part="dev", dry_run=False):
+        self.calls.append({"domain": domain, "worker": worker,
+                           "forward_to": forward_to, "local_part": local_part,
+                           "dry_run": dry_run})
+        out = self.per_domain.get(domain, self.result)
+        if out is None:
+            target = forward_to or ("worker:%s" % worker)
+            out = ({"status": "dry_run", "would": "create", "target": target}
+                   if dry_run
+                   else {"status": "configured", "created": True,
+                         "target": target})
+        return dict(out)
 
 
 class _DB:
@@ -128,16 +127,21 @@ class _DB:
         "stage_email must not write to the database")
 
 
-def run_stage(rows, get_body, set_body=OK_SET, dry_run=False,
-              get_raises=None, base_dir=None):
-    calls = _Calls(get_body, set_body, get_raises)
-    saved = (requests.get, pipeline.db, pipeline.BASE_DIR,
+def run_stage(rows, result=None, per_domain=None, dry_run=False,
+              base_dir=None, worker=""):
+    calls = _Routes(result, per_domain)
+    saved = (cloudflare_dns.ensure_dev_route, pipeline.db, pipeline.BASE_DIR,
              pipeline.COMPANIES_DIR)
+    saved_worker = os.environ.get("CLOUDFLARE_EMAIL_WORKER")
     buf = io.StringIO()
     err = None
     try:
-        requests.get = calls
+        cloudflare_dns.ensure_dev_route = calls
         pipeline.db = _DB(rows)
+        if worker:
+            os.environ["CLOUDFLARE_EMAIL_WORKER"] = worker
+        else:
+            os.environ.pop("CLOUDFLARE_EMAIL_WORKER", None)
         if base_dir is not None:
             # COMPANIES_DIR is bound at import from BASE_DIR, so patching
             # BASE_DIR alone does NOT redirect it - a check of mine passed
@@ -150,8 +154,12 @@ def run_stage(rows, get_body, set_body=OK_SET, dry_run=False,
     except Exception as e:                      # noqa: BLE001 - reported
         err = e
     finally:
-        (requests.get, pipeline.db, pipeline.BASE_DIR,
+        (cloudflare_dns.ensure_dev_route, pipeline.db, pipeline.BASE_DIR,
          pipeline.COMPANIES_DIR) = saved
+        if saved_worker is None:
+            os.environ.pop("CLOUDFLARE_EMAIL_WORKER", None)
+        else:
+            os.environ["CLOUDFLARE_EMAIL_WORKER"] = saved_worker
     return calls, buf.getvalue(), err
 
 
@@ -166,221 +174,124 @@ def _co(cn="00000001", name="ACME LTD", domain="acme.uk",
 ONE = [_co()]
 
 
-# ── the production-safety invariant ─────────────────────────────────────
+# ── the production-safety invariant ──────────────────────
 def check_dry_run(r: Results) -> None:
-    print("\n-- dry_run must issue no setEmailForwarding call --")
-    calls, out, err = run_stage(ONE, forwarding_xml(("info", "i@real.example")),
-                                dry_run=True)
-    r.check("dry_run raised nothing", err is None, repr(err))
-    r.check("dry_run issued ZERO set calls", calls.sets == [],
-            f"set calls: {calls.sets}")
-    r.check("dry_run still read the current forwards", len(calls.gets) == 1,
-            f"get calls: {len(calls.gets)}")
-    r.check("dry_run reported what it would do", "DRY" in out, f"out {out!r}")
-
-    # Control: the same input without dry_run MUST issue a set call, or the
-    # check above passes for the wrong reason.
-    calls2, _, _ = run_stage(ONE, forwarding_xml(("info", "i@real.example")))
-    r.check("the same input DOES set when dry_run is off",
-            len(calls2.sets) == 1,
-            f"set calls: {calls2.sets}; if empty the dry_run check is vacuous")
-
-
-# ── never destroy an existing forward ───────────────────────────────────
-def check_preserves_existing(r: Results) -> None:
-    print("\n-- existing forwards survive the replace-the-whole-set call --")
-    existing = (("info", "i@real.example"), ("sales", "s@real.example"))
-    calls, out, err = run_stage(ONE, forwarding_xml(*existing))
+    print("\n-- dry_run writes nothing --")
+    calls, out, err = run_stage(ONE, dry_run=True)
     r.check("raised nothing", err is None, repr(err))
-    if not r.check("exactly one set call", len(calls.sets) == 1,
-                   f"{calls.sets}"):
-        return
-    p = calls.sets[0]
-    pairs = {}
-    i = 1
-    while f"mailbox{i}" in p:
-        pairs[p[f"mailbox{i}"]] = p[f"ForwardTo{i}"]
-        i += 1
-    r.check("both existing mailboxes are re-submitted",
-            pairs.get("info") == "i@real.example"
-            and pairs.get("sales") == "s@real.example",
-            f"submitted {pairs}")
-    r.check("dev is added", pairs.get("dev") == "owner@real.example",
-            f"submitted {pairs}")
-    r.check("nothing else is submitted", set(pairs) == {"info", "sales", "dev"},
-            f"submitted {sorted(pairs)}")
-    r.check("the target domain is carried on the set call",
-            p.get("DomainName") == "acme.uk", f"DomainName={p.get('DomainName')!r}")
+    r.check("the provider was still consulted", len(calls.calls) == 1,
+            f"calls={calls.calls}")
+    r.check("and it was told this is a dry run",
+            calls.calls and calls.calls[0]["dry_run"] is True,
+            f"calls={calls.calls}")
+    r.check("the output says what it WOULD do", "DRY" in out, f"out {out!r}")
+    r.check("...naming the address", "dev@acme.uk" in out, f"out {out!r}")
+
+    calls, out, err = run_stage(ONE, dry_run=False)
+    r.check("the same input does NOT dry-run when the flag is off",
+            calls.calls and calls.calls[0]["dry_run"] is False,
+            f"calls={calls.calls}")
+    r.check("...and reports a real write", "SET" in out, f"out {out!r}")
 
 
-def check_malformed_forward_refused(r: Results) -> None:
-    print("\n-- a forward with an empty field makes the domain refuse --")
-    # setEmailForwarding replaces the whole set, so an entry that cannot be
-    # re-submitted faithfully would be DELETED. The old code filtered such
-    # entries out and submitted the remainder, deleting them silently. It now
-    # refuses the domain. A missing dev@ forward is recoverable by re-running;
-    # someone else's deleted mail routing is not.
-    for label, pairs in (
-            ("empty mailbox (a catch-all shape)",
-             (("", "catchall@real.example"), ("info", "i@real.example"))),
-            ("empty target",
-             (("info", ""), ("sales", "s@real.example"))),
-            ("both empty", (("", ""),)),
-    ):
-        calls, out, err = run_stage(ONE, forwarding_xml(*pairs))
-        r.check(f"{label}: raised nothing", err is None, repr(err))
-        r.check(f"{label}: NOTHING is submitted, so nothing is deleted",
-                calls.sets == [], f"set calls: {calls.sets}")
-        r.check(f"{label}: the refusal is explained", "SKIP" in out
-                and "empty mailbox or target" in out, f"out {out!r}")
-        r.check(f"{label}: the offending entries are shown",
-                "Refusing to rewrite" in out, f"out {out!r}")
-
-    # Control: well-formed forwards must still be processed, or "nothing is
-    # submitted" above would pass for every input and prove nothing.
-    calls, out, err = run_stage(
-        ONE, forwarding_xml(("info", "i@real.example")))
-    r.check("a well-formed set is still processed", len(calls.sets) == 1,
-            f"set calls: {calls.sets}; if empty the refusals above are vacuous")
+def check_the_merge_hazard_is_gone(r: Results) -> None:
+    """The replacement for check_preserves_existing and
+    check_malformed_forward_refused. See the module docstring: the
+    read-modify-write of a whole forwarding set no longer exists, so the
+    thing to assert is its ABSENCE, not a guard around it."""
+    print("\n-- the read-merge-replace hazard no longer exists --")
+    src = open(os.path.join(REPO, "pipeline.py"), encoding="utf-8").read()
+    body = src[src.index("def stage_email("):]
+    body = body[:body.index("\ndef ", 10)]
+    code = "\n".join(l for l in body.splitlines()
+                     if not l.strip().startswith("#"))
+    for banned in ("getEmailForwarding", "setEmailForwarding", "setHosts",
+                   "api.namecheap.com", "ET.fromstring"):
+        r.check(f"the stage no longer calls {banned}", banned not in code,
+                f"found {banned!r} in stage_email")
+    calls, out, err = run_stage(ONE)
+    r.check("exactly one provider call per company", len(calls.calls) == 1,
+            f"calls={calls.calls} - a read-then-write would be two")
 
 
-# ── idempotency ─────────────────────────────────────────────────────────
 def check_already_configured(r: Results) -> None:
-    print("\n-- a dev forward that already exists is left alone --")
-    calls, out, err = run_stage(
-        ONE, forwarding_xml(("dev", "owner@real.example"),
-                            ("info", "i@real.example")))
+    print("\n-- a route that already exists is reported, not rewritten --")
+    calls, out, err = run_stage(ONE, route(created=False))
     r.check("raised nothing", err is None, repr(err))
-    r.check("no set call is issued", calls.sets == [], f"{calls.sets}")
-    r.check("reported as already set up", "already set up" in out, f"out {out!r}")
-
-    # Idempotent regardless of where dev points: the check at :227 tests the
-    # mailbox name only. Pinned so a change to that is deliberate.
-    calls2, out2, _ = run_stage(
-        ONE, forwarding_xml(("dev", "somewhere-else@real.example")))
-    r.check("a dev forward pointing elsewhere is still left alone",
-            calls2.sets == [], f"{calls2.sets}")
-
-
-# ── provider errors ─────────────────────────────────────────────────────
-def check_provider_errors(r: Results) -> None:
-    print("\n-- the provider refuses, errors, or answers rubbish --")
-    calls, out, err = run_stage(ONE, error_xml("Domain is not using Namecheap DNS"))
-    r.check("an external-DNS error skips without setting",
-            err is None and calls.sets == [] and "SKIP" in out,
-            f"err={err!r} sets={calls.sets} out={out!r}")
-
-    calls, out, err = run_stage(ONE, error_xml("Invalid request IP"))
-    r.check("any other error is reported without setting",
-            err is None and calls.sets == [] and "ERROR" in out,
-            f"err={err!r} sets={calls.sets} out={out!r}")
-    r.check("the error text is shown to the operator",
-            "Invalid request IP" in out, f"out {out!r}")
-
-    calls, out, err = run_stage(ONE, forwarding_xml(), set_body=error_xml("Boom"))
-    r.check("a failing set call is reported, not swallowed",
-            err is None and "ERROR setting forwarding" in out, f"out {out!r}")
-
-    # These used to propagate and abort the stage. They are now reported
-    # per company and the run continues, matching what an API-reported error
-    # two lines earlier in the code already did.
-    calls, out, err = run_stage(ONE, "this is not xml")
-    r.check("malformed XML is reported, not raised",
-            err is None and calls.sets == [], f"err={err!r} sets={calls.sets}")
-    r.check("the parse failure names the exception type",
-            "ParseError" in out and "ERROR reading forwards" in out,
+    r.check("reported as already routed", "already routed" in out,
+            f"out {out!r}")
+    r.check("not counted as a new route", "0 route(s) created" in out,
             f"out {out!r}")
 
-    calls, out, err = run_stage(
-        ONE, forwarding_xml(),
-        get_raises=requests.exceptions.ConnectTimeout("timeout"))
-    r.check("a connection timeout is reported and sets nothing",
-            err is None and calls.sets == [], f"err={err!r} sets={calls.sets}")
-    r.check("the timeout names the exception type",
-            "ConnectTimeout" in out, f"out {out!r}")
+    calls, out, err = run_stage(ONE, route(created=True))
+    r.check("a newly created route IS counted", "1 route(s) created" in out,
+            f"out {out!r}")
 
-    # The guard is narrow on purpose. An unexpected exception type inside it
-    # means a fault in this code, not a provider hiccup, and must propagate
-    # instead of being logged per domain and skipped. Widening the catch to
-    # bare Exception survived this suite until this check existed - the
-    # credential case below does NOT distinguish them, because _api() is
-    # evaluated outside the try and so aborts either way.
-    calls, out, err = run_stage(ONE, forwarding_xml(),
-                                get_raises=ValueError("a bug, not the network"))
-    r.check("an unexpected exception type still propagates",
-            isinstance(err, ValueError) and calls.sets == [],
-            f"err={err!r} sets={calls.sets}; a bare `except Exception` would "
-            "swallow this and report it as a per-domain failure")
 
-    # A missing credential aborts too, for its own reason.
-    saved = os.environ.pop("NAMECHEAP_API_KEY")
-    try:
-        calls, out, err = run_stage(ONE, forwarding_xml())
-        r.check("a missing credential aborts rather than being skipped",
-                isinstance(err, KeyError), f"err={err!r}")
-    finally:
-        os.environ["NAMECHEAP_API_KEY"] = saved
-    calls, _, err = run_stage(ONE, forwarding_xml())
-    r.check("credentials restored for later checks",
-            err is None and len(calls.sets) == 1, f"err={err!r}")
+def check_status_taxonomy(r: Results) -> None:
+    """Every way ensure_dev_route can not-work must reach the operator."""
+    print("\n-- each failure status is counted and explained --")
+    cases = [
+        ("not_delegated", {"status": "not_delegated",
+                           "message": "acme.uk has no zone here"},
+         "SKIP", "no zone here", "1 skipped"),
+        ("error", {"status": "error", "error": "Cloudflare said no"},
+         "ERROR", "Cloudflare said no", "1 failed"),
+        ("pending_verification", {"status": "pending_verification",
+                                  "message": "nobody clicked the link"},
+         "ERROR", "nobody clicked the link", "1 failed"),
+        ("routing_not_ready", {"status": "routing_not_ready",
+                               "message": "Email Routing is not ready"},
+         "ERROR", "not ready", "1 failed"),
+    ]
+    for status, result, marker, needle, tally in cases:
+        calls, out, err = run_stage(ONE, result)
+        r.check(f"{status}: raised nothing", err is None, repr(err))
+        r.check(f"{status}: printed as {marker}", marker in out, f"out {out!r}")
+        r.check(f"{status}: the reason reaches the operator", needle in out,
+                f"out {out!r}")
+        r.check(f"{status}: counted as {tally}", tally in out, f"out {out!r}")
+        r.check(f"{status}: the status word itself is shown",
+                status in out or marker == "SKIP", f"out {out!r}")
 
 
 def check_partial_completion(r: Results) -> None:
-    print("\n-- a failure midway leaves earlier companies already changed --")
-    # Keywords, not positions: `name` was added as the second parameter of
-    # _co, which silently turned "first.uk" into a company name and left both
-    # rows on the default domain.
-    rows = [_co(cn="00000001", domain="first.uk"),
-            _co(cn="00000002", domain="second.uk")]
-    # Good for the first company, unparseable for the second.
-    state = {"n": 0}
-    good = forwarding_xml(("info", "i@real.example"))
-
-    calls = _Calls(good)
-    orig_call = calls.__call__
-
-    def seq(url, params=None, **kw):
-        params = params or {}
-        if params.get("Command") == GET_CMD:
-            state["n"] += 1
-            if state["n"] == 2:
-                calls.calls.append((GET_CMD, dict(params)))
-
-                class _Bad:
-                    text = "<<<not xml"
-                return _Bad()
-        return orig_call(url, params=params, **kw)
-
-    saved_get, saved_db = requests.get, pipeline.db
-    buf, err = io.StringIO(), None
-    try:
-        requests.get = seq
-        pipeline.db = _DB(rows)
-        with redirect_stdout(buf):
-            pipeline.stage_email(dry_run=False)
-    except Exception as e:                      # noqa: BLE001
-        err = e
-    finally:
-        requests.get = saved_get
-        pipeline.db = saved_db
-
-    out = buf.getvalue()
-    r.check("one bad company no longer aborts the run", err is None,
-            f"err={err!r}")
-    r.check("the first company was still configured",
-            len(calls.sets) == 1
-            and calls.sets[0].get("DomainName") == "first.uk",
-            f"sets={calls.sets}")
-    r.check("the second company is reported as failed, not silent",
-            "ERROR reading forwards" in out, f"out {out!r}")
-    r.check("the summary accounts for both",
-            "1 forward(s) created" in out and "1 failed" in out,
+    print("\n-- one company's bad day does not stop the rest --")
+    rows = [_co(cn="00000001", domain="good.uk"),
+            _co(cn="00000002", domain="bad.uk"),
+            _co(cn="00000003", domain="also-good.uk")]
+    calls, out, err = run_stage(rows, per_domain={
+        "bad.uk": {"status": "error", "error": "provider exploded"}})
+    r.check("raised nothing", err is None, repr(err))
+    r.check("all three were attempted", len(calls.calls) == 3,
+            f"calls={[c['domain'] for c in calls.calls]}")
+    r.check("the good ones were configured",
+            out.count("SET") == 2, f"out {out!r}")
+    r.check("the bad one is reported, not silent", "provider exploded" in out,
             f"out {out!r}")
-    r.check("and states how many were considered",
-            "of 2 considered" in out, f"out {out!r}")
+    r.check("the summary accounts for all of them",
+            "2 route(s) created" in out and "1 failed" in out
+            and "of 3 considered" in out, f"out {out!r}")
 
 
-# ── which companies are considered ──────────────────────────────────────
+def check_worker_is_preferred_over_a_forward(r: Results) -> None:
+    print("\n-- a Worker route is requested when one is configured --")
+    calls, out, err = run_stage(ONE, worker="gglabs-inbound")
+    r.check("the worker name is passed through",
+            calls.calls and calls.calls[0]["worker"] == "gglabs-inbound",
+            f"calls={calls.calls}")
+    r.check("and NO forward target is passed",
+            calls.calls and calls.calls[0]["forward_to"] is None,
+            "a forward needs a human to verify each company's mailbox, which "
+            "is the manual step a Worker exists to avoid")
+
+    calls, out, err = run_stage(ONE)
+    r.check("with no Worker configured it falls back to a forward",
+            calls.calls and calls.calls[0]["worker"] is None
+            and calls.calls[0]["forward_to"] == "owner@real.example",
+            f"calls={calls.calls}")
+
+
 def check_row_filter(r: Results) -> None:
     print("\n-- a company needs a number, a domain AND an email --")
     cases = [
@@ -389,28 +300,29 @@ def check_row_filter(r: Results) -> None:
         ("no email", _co(email="")),
     ]
     for label, row in cases:
-        calls, out, err = run_stage([row], forwarding_xml())
+        calls, out, err = run_stage([row], route())
         r.check(f"{label}: nothing is contacted",
                 err is None and calls.calls == [],
                 f"calls={calls.calls}")
-    calls, out, err = run_stage([_co()], forwarding_xml())
-    r.check("a complete row IS processed", len(calls.gets) == 1,
-            f"gets={len(calls.gets)}; if 0 the checks above are vacuous")
+    calls, out, err = run_stage([_co()], route())
+    r.check("a complete row IS processed", len(calls.calls) == 1,
+            f"calls={calls.calls}; if 0 the checks above are vacuous")
 
 
 def check_dev_address(r: Results) -> None:
     print("\n-- the dev mailbox is derived from the domain, not the email --")
     calls, out, err = run_stage(
         [_co(domain="weird-domain.co.uk", email="someone@elsewhere.test")],
-        forwarding_xml())
-    if not r.check("one set call", len(calls.sets) == 1, f"{calls.sets}"):
+        route(target="someone@elsewhere.test"))
+    if not r.check("one provider call", len(calls.calls) == 1,
+                   f"{calls.calls}"):
         return
-    p = calls.sets[0]
-    r.check("the mailbox is 'dev'", p.get("mailbox1") == "dev",
-            f"mailbox1={p.get('mailbox1')!r}")
+    c = calls.calls[0]
+    r.check("the domain is passed, not the email",
+            c["domain"] == "weird-domain.co.uk", f"call={c!r}")
+    r.check("the mailbox is 'dev'", c["local_part"] == "dev", f"call={c!r}")
     r.check("it forwards to the ASSIGNED email, not dev@domain",
-            p.get("ForwardTo1") == "someone@elsewhere.test",
-            f"ForwardTo1={p.get('ForwardTo1')!r}")
+            c["forward_to"] == "someone@elsewhere.test", f"call={c!r}")
     r.check("the printed address is dev@<domain>",
             "dev@weird-domain.co.uk" in out, f"out {out!r}")
 
@@ -434,7 +346,7 @@ def check_manifest(r: Results) -> None:
         _fresh_manifest(built)
         _fresh_manifest(stale)
 
-        calls, out, err = run_stage(ONE, forwarding_xml(), base_dir=tmp)
+        calls, out, err = run_stage(ONE, base_dir=tmp)
         r.check("raised nothing", err is None, repr(err))
         r.check("the build's manifest IS updated",
                 json.loads(built.read_text())["support_email"] == "dev@acme.uk",
@@ -450,8 +362,7 @@ def check_manifest(r: Results) -> None:
         bare = po / "companies" / "00000001" / "app" / "manifest.json"
         _fresh_manifest(built)
         _fresh_manifest(bare)
-        calls, out, err = run_stage([_co(name="")], forwarding_xml(),
-                                    base_dir=tmp)
+        calls, out, err = run_stage([_co(name="")], base_dir=tmp)
         r.check("a nameless row updates <cn>/, not <cn> - <name>/",
                 json.loads(bare.read_text())["support_email"] == "dev@acme.uk"
                 and json.loads(built.read_text())["support_email"]
@@ -461,15 +372,13 @@ def check_manifest(r: Results) -> None:
 
         # Already correct -> left alone, and said so.
         _fresh_manifest(built, "dev@acme.uk")
-        calls, out, err = run_stage(ONE, forwarding_xml(("dev", "x@real.example")),
-                                    base_dir=tmp)
+        calls, out, err = run_stage(ONE, route(created=False), base_dir=tmp)
         r.check("an already-correct manifest is not rewritten and says so",
                 "manifest already has" in out, f"out {out!r}")
 
         # dry_run must not write the manifest either.
         _fresh_manifest(built)
-        calls, out, err = run_stage(ONE, forwarding_xml(), dry_run=True,
-                                    base_dir=tmp)
+        calls, out, err = run_stage(ONE, dry_run=True, base_dir=tmp)
         r.check("dry_run leaves the manifest untouched",
                 json.loads(built.read_text())["support_email"]
                 == "stale@real.example", f"out {out!r}")
@@ -478,8 +387,50 @@ def check_manifest(r: Results) -> None:
 
         # A missing manifest must not raise - the build may not have run.
         shutil.rmtree(po / "companies")
-        calls, out, err = run_stage(ONE, forwarding_xml(), base_dir=tmp)
+        calls, out, err = run_stage(ONE, base_dir=tmp)
         r.check("a missing manifest is not an error", err is None, repr(err))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_unrouted_company_does_not_get_a_support_email(r: Results) -> None:
+    """A company whose dev@ is not routed must NOT have that address shipped
+    into its app manifest.
+
+    support_email is what Play Console review writes to. Advertising
+    dev@<domain> for a domain whose mail does not work is worse than leaving
+    the stale value: it looks configured and silently goes nowhere. Found by
+    a surviving mutant that deleted the `continue` after the SKIP.
+    """
+    print("\n-- an unrouted company's manifest is left alone --")
+    tmp = tempfile.mkdtemp()
+    try:
+        po = Path(tmp) / "pipeline_output"
+        built = po / "companies" / "00000001 - ACME LTD" / "app" / "manifest.json"
+        for status, result in [
+            ("not_delegated", {"status": "not_delegated",
+                               "message": "acme.uk has no zone here"}),
+            ("error", {"status": "error", "error": "provider exploded"}),
+            ("pending_verification", {"status": "pending_verification",
+                                      "message": "nobody clicked"}),
+        ]:
+            _fresh_manifest(built)
+            calls, out, err = run_stage(ONE, result, base_dir=tmp)
+            r.check(f"{status}: the manifest is NOT rewritten",
+                    json.loads(built.read_text())["support_email"]
+                    == "stale@real.example",
+                    f"manifest became "
+                    f"{json.loads(built.read_text())!r} - the app would "
+                    f"advertise a support address that receives nothing")
+            r.check(f"{status}: and no manifest update is claimed",
+                    "UPD" not in out, f"out {out!r}")
+
+        # The check must be capable of failing: a CONFIGURED route does write.
+        _fresh_manifest(built)
+        calls, out, err = run_stage(ONE, route(), base_dir=tmp)
+        r.check("a configured route DOES update the manifest",
+                json.loads(built.read_text())["support_email"] == "dev@acme.uk",
+                "if this fails the three checks above are vacuous")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -599,7 +550,7 @@ def check_co_dir_matches_writer(r: Results) -> None:
 def check_no_db_write(r: Results) -> None:
     print("\n-- the stage never writes to the database --")
     # _DB.update_row raises; reaching it would surface as an error here.
-    calls, out, err = run_stage(ONE, forwarding_xml())
+    calls, out, err = run_stage(ONE, route())
     r.check("no db write attempted", err is None, f"err={err!r}")
 
 
@@ -607,14 +558,15 @@ def main() -> int:
     r = Results()
     print(f"target: {os.path.join(REPO, 'pipeline.py')} stage_email")
     check_dry_run(r)
-    check_preserves_existing(r)
-    check_malformed_forward_refused(r)
+    check_the_merge_hazard_is_gone(r)
     check_already_configured(r)
-    check_provider_errors(r)
+    check_status_taxonomy(r)
     check_partial_completion(r)
+    check_worker_is_preferred_over_a_forward(r)
     check_row_filter(r)
     check_dev_address(r)
     check_manifest(r)
+    check_unrouted_company_does_not_get_a_support_email(r)
     check_print_summary(r)
     check_co_dir_matches_writer(r)
     check_no_db_write(r)

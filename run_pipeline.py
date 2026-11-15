@@ -1127,11 +1127,7 @@ def setup_play_console_domain_assets(result, google_txt_token="", google_txt_hos
     This never interacts with Google. If no Google TXT token is supplied, DNS is
     left unchanged and the dossier records token_pending.
     """
-    from namecheap_automation import (
-        ensure_dev_email_forwarding,
-        prepare_google_txt_record,
-        set_default_dns,
-    )
+    import cloudflare_dns
     from play_console_readiness import developer_email_for_domain
 
     domain = (result.get("domain") or {}).get("domain", "")
@@ -1155,18 +1151,28 @@ def setup_play_console_domain_assets(result, google_txt_token="", google_txt_hos
     if not domain or not account_email:
         return play
 
-    dns_result = set_default_dns(domain)
-    play["namecheap_default_dns"] = dns_result
+    # The set_default_dns call that used to stand here is gone, deliberately.
+    # It pointed the domain back at NAMECHEAP's nameservers so that
+    # Namecheap's own TXT and forwarding would work - which, on a domain
+    # delegated to Cloudflare, silently revokes the delegation and takes the
+    # zone's DNS and mail with it. Nothing read the "namecheap_default_dns"
+    # key it wrote, so removing it loses no information.
+    #
+    # The division of labour is now explicit: Namecheap is the REGISTRAR. It
+    # checks availability, buys the domain and sets its nameservers.
+    # Cloudflare owns everything inside the zone - records and mail.
+    worker = os.getenv("CLOUDFLARE_EMAIL_WORKER", "").strip()
+    play["developer_email_forwarding"] = cloudflare_dns.ensure_dev_route(
+        domain,
+        worker=worker or None,
+        forward_to=None if worker else account_email,
+    )
 
-    forwarding_result = ensure_dev_email_forwarding(domain, account_email)
-    play["developer_email_forwarding"] = forwarding_result
-
-    txt_result = prepare_google_txt_record(
+    play["google_txt"] = cloudflare_dns.ensure_google_txt_record(
         domain,
         txt_value=google_txt_token,
         hostname=google_txt_host or "@",
     )
-    play["google_txt"] = txt_result
     return play
 
 

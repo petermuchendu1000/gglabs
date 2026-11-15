@@ -700,7 +700,8 @@ def _rule_for_address(zone_id, expected_domain, address):
     return {"rule": None}
 
 
-def ensure_dev_route(domain, worker=None, forward_to=None, local_part="dev"):
+def ensure_dev_route(domain, worker=None, forward_to=None, local_part="dev",
+                     dry_run=False):
     """Route <local_part>@domain with Cloudflare Email Routing.
 
     This replaces namecheap_automation.ensure_dev_email_forwarding, which
@@ -773,10 +774,21 @@ def ensure_dev_route(domain, worker=None, forward_to=None, local_part="dev"):
         action = {"type": "worker", "value": [str(worker)]}
         target = "worker:%s" % worker
     elif forward_to:
-        dest = ensure_destination_address(forward_to)
-        if "error" in dest:
-            return {"status": "error", "domain": domain, "address": address,
-                    "error": dest["error"]}
+        if dry_run:
+            # Registering a destination address is itself a write (it sends a
+            # verification mail), so a dry run only READS the list.
+            listing = list_destination_addresses()
+            if "error" in listing:
+                return {"status": "error", "domain": domain, "address": address,
+                        "error": listing["error"]}
+            wanted = forward_to.strip().lower()
+            match = [a for a in listing["addresses"] if a["email"] == wanted]
+            dest = match[0] if match else {"email": wanted, "verified": False}
+        else:
+            dest = ensure_destination_address(forward_to)
+            if "error" in dest:
+                return {"status": "error", "domain": domain, "address": address,
+                        "error": dest["error"]}
         if not dest.get("verified"):
             return {"status": "pending_verification", "domain": domain,
                     "address": address, "zone_id": zone_id,
@@ -800,6 +812,16 @@ def ensure_dev_route(domain, worker=None, forward_to=None, local_part="dev"):
             "enabled": True,
             "matchers": [{"type": "literal", "field": "to", "value": address}],
             "actions": [action]}
+
+    if dry_run:
+        # A distinct status, never "configured": a dry run that reported the
+        # same word as a real one would be the silent-success defect wearing
+        # a different hat.
+        return {"status": "dry_run",
+                "would": "create" if existing is None else "update",
+                "domain": domain, "address": address, "zone_id": zone_id,
+                "target": target,
+                "rule_id": existing["rule_id"] if existing else None}
 
     if existing is None:
         call = _request("POST", "/zones/%s/email/routing/rules" % zone_id,
@@ -830,3 +852,75 @@ def ensure_dev_route(domain, worker=None, forward_to=None, local_part="dev"):
             "target": target,
             "forward_to": forward_to if forward_to and not worker else None,
             "worker": str(worker) if worker else None}
+
+
+def ensure_google_txt_record(domain, txt_value="", hostname="@"):
+    """Apply Google's verification TXT record on Cloudflare.
+
+    Replaces namecheap_automation.prepare_google_txt_record, and keeps its
+    contract: a blank token changes NOTHING and reports token_pending, so
+    the pipeline stays Google-safe while still recording the exact action to
+    run once a human has the token.
+
+    Two things make the Cloudflare version safer than the Namecheap one it
+    replaces. Namecheap's setHosts takes the COMPLETE record set, so adding
+    one TXT meant reading every record back and reposting them - and any
+    record that failed to read was deleted. Cloudflare creates records
+    individually, so nothing else on the zone is touched. And the old path
+    called set_default_dns first, which points the domain back at Namecheap's
+    nameservers; on a delegated domain that would silently revoke the
+    delegation.
+
+    Re-running with the same token is a no-op rather than a duplicate.
+    """
+    domain = (domain or "").strip().lower().rstrip(".")
+    txt_value = (txt_value or "").strip()
+    hostname = (hostname or "@").strip() or "@"
+    if not domain:
+        return {"status": "error", "error": "domain is required"}
+
+    if not txt_value:
+        return {"status": "token_pending",
+                "domain": domain,
+                "hostname": hostname,
+                "value": "",
+                "message": "Paste Google's TXT token, then rerun DNS setup."}
+
+    zone = find_zone(domain)
+    if "error" in zone:
+        return {"status": "error", "domain": domain, "hostname": hostname,
+                "value": txt_value, "error": zone["error"]}
+    if not zone.get("found"):
+        return {"status": "not_delegated", "domain": domain,
+                "hostname": hostname, "value": txt_value,
+                "message": ("%s has no zone in this Cloudflare account, so the "
+                            "Google TXT record cannot be written until the "
+                            "domain is delegated" % domain)}
+    zone_id = zone["zone_id"]
+
+    record_name = domain if hostname == "@" else "%s.%s" % (
+        hostname.rstrip(".").lower(), domain)
+
+    existing = list_txt_records(zone_id, domain)
+    if "error" in existing:
+        return {"status": "error", "domain": domain, "hostname": hostname,
+                "value": txt_value, "error": existing["error"]}
+    for record in existing["records"]:
+        # Cloudflare may hand back TXT content wrapped in quotes; compare the
+        # unwrapped form so a re-run does not add a second identical record.
+        content = str(record.get("content") or "").strip().strip('"')
+        if (str(record.get("name") or "").lower() == record_name
+                and content == txt_value):
+            return {"status": "configured", "domain": domain,
+                    "hostname": hostname, "value": txt_value,
+                    "zone_id": zone_id, "record_id": record.get("record_id"),
+                    "created": False}
+
+    written = add_txt_record(zone_id, domain, hostname, txt_value,
+                             comment="Google site verification (pipeline)")
+    if "error" in written:
+        return {"status": "error", "domain": domain, "hostname": hostname,
+                "value": txt_value, "error": written["error"]}
+    return {"status": "configured", "domain": domain, "hostname": hostname,
+            "value": txt_value, "zone_id": zone_id,
+            "record_id": written.get("record_id"), "created": True}

@@ -1,7 +1,35 @@
 """
 Namecheap Domain Automation Module
-Handles domain availability checking, registration, and DNS TXT record management
-via the Namecheap API for the Google Play Developer pipeline.
+
+NAMECHEAP IS THE REGISTRAR. IT IS NOT THE DNS OR MAIL PROVIDER.
+
+That boundary is deliberate and it is load-bearing. Domains bought here are
+delegated to Cloudflare, and from that moment Namecheap no longer serves the
+zone: its free email forwarding REQUIRES Namecheap DNS and simply stops
+existing, and domains.dns.setHosts/setDefault would point the domain back at
+Namecheap's nameservers and silently REVOKE the delegation, taking the zone's
+records and mail with it.
+
+So the pipeline uses this module for registrar work only:
+
+    availability and pricing   check_domains, find_cheapest_domain,
+                               get_pricing, one_year_price
+    buying                     register_domain, get_balance,
+                               available_balance, enable_privacy
+    account and contacts       list_account_domains, get_domain_list,
+                               get_address_*, get_domain_contacts,
+                               get_existing_account_contact
+    nameservers                setting them at the registrar is the one DNS
+                               -adjacent thing that MUST stay here, because
+                               only the registrar can delegate a domain
+
+Everything inside the zone - records, TXT verification, dev@ routing - lives
+in cloudflare_dns.py. The functions below that write host records or email
+forwarding (set_dns_hosts, add_txt_record, prepare_google_txt_record,
+set_default_dns, set_email_forwarding*, ensure_dev_email_forwarding) are kept
+for domains that have not been delegated yet and for reading existing state.
+Nothing on the dev@ path calls them any more; if you are about to wire one
+back in, you are probably about to break a delegated domain.
 
 API Docs: https://www.namecheap.com/support/api/methods/
 """

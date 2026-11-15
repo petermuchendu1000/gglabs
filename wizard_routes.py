@@ -530,8 +530,18 @@ def domains_email_forwarding():
     if not domain or not forward_to:
         return jsonify({"error": "domain and forward_to required"}), 400
     try:
-        from namecheap_automation import set_email_forwarding
-        result = set_email_forwarding(domain, "support", forward_to)
+        # Cloudflare, not Namecheap: Namecheap's free forwarding requires
+        # Namecheap DNS and stops existing the moment the domain is
+        # delegated. Note Cloudflare will not deliver to a destination
+        # address nobody has verified, so a brand new forward_to comes back
+        # as pending_verification rather than as a working route.
+        import cloudflare_dns
+        result = cloudflare_dns.ensure_dev_route(
+            domain, forward_to=forward_to, local_part="support")
+        if result.get("status") != "configured":
+            # A route that was not created must not answer 200. The old code
+            # returned the provider's error dict with a success status.
+            return jsonify(result), 400
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -554,15 +564,22 @@ def domains_apply_google_txt():
         return jsonify({"error": "txt_value is required"}), 400
 
     try:
-        from namecheap_automation import set_default_dns, add_txt_record
+        # The set_default_dns call that used to run first is gone. It pointed
+        # the domain back at Namecheap's nameservers so Namecheap's setHosts
+        # would work - which on a delegated domain revokes the delegation.
+        # Cloudflare writes the record individually, so nothing else on the
+        # zone is read or rewritten either.
+        import cloudflare_dns
 
-        dns_result = set_default_dns(domain)
-        if "error" in dns_result:
-            return jsonify({"error": dns_result["error"], "stage": "set_default_dns"}), 400
-
-        txt_result = add_txt_record(domain, txt_value, hostname=hostname)
-        if "error" in txt_result:
-            return jsonify({"error": txt_result["error"], "stage": "add_txt_record"}), 400
+        txt_result = cloudflare_dns.ensure_google_txt_record(
+            domain, txt_value=txt_value, hostname=hostname)
+        if txt_result.get("status") != "configured":
+            return jsonify({
+                "error": (txt_result.get("message") or txt_result.get("error")
+                          or "the TXT record was not written"),
+                "status": txt_result.get("status"),
+                "stage": "cloudflare_txt",
+            }), 400
 
         # Best-effort write-back to Supabase, the single source of truth.
         # The response key is still "excel_updated" because static/wizard.js

@@ -287,20 +287,8 @@ def stage_match(dry_run: bool = False) -> None:
 # ── Stage 3: Dev email setup ─────────────────────────────────────────────────
 
 def stage_email(dry_run: bool = False) -> None:
-    _banner("STAGE 3 — dev@ email forwarding")
-    import requests
-    import xml.etree.ElementTree as ET
-
-    API_URL    = "https://api.namecheap.com/xml.response"
-    NS         = {"nc": "http://api.namecheap.com/xml.response"}
-
-    def _api():
-        return {
-            "ApiUser":  os.environ["NAMECHEAP_API_USER"],
-            "ApiKey":   os.environ["NAMECHEAP_API_KEY"],
-            "UserName": os.environ["NAMECHEAP_USERNAME"],
-            "ClientIp": os.environ["NAMECHEAP_CLIENT_IP"],
-        }
+    _banner("STAGE 3 — dev@ email routing (Cloudflare)")
+    import cloudflare_dns
 
     # Load companies with a domain + assigned email from Supabase. The name
     # is carried too: the manifest lives under _co_dir(cn, name), so without
@@ -321,94 +309,63 @@ def stage_email(dry_run: bool = False) -> None:
     # one that did nothing.
     written = skipped = failed = 0
 
+    # A Worker route needs no destination verification; a forward needs a
+    # human to click a link in each company's own mailbox. See
+    # cloudflare_dns.ensure_dev_route.
+    worker = os.getenv("CLOUDFLARE_EMAIL_WORKER", "").strip()
+
     for cn, co_name, domain, assigned_email in companies:
         dev_email = f"dev@{domain}"
         print(f"\n  [{cn}] {domain}")
 
-        # Get existing forwards. A transport failure or an unparseable body
-        # used to propagate and abort the whole stage, leaving every company
-        # already processed in this run modified and printing no summary -
-        # even though an error REPORTED BY the API two lines below merely
-        # skips the company and carries on. One domain's bad day should not
-        # decide whether the rest are configured.
+        # This used to be ~80 lines of inline Namecheap XML: read the whole
+        # forwarding set, merge dev@ into it, post the whole set back. That
+        # shape was dangerous on its own terms - setEmailForwarding REPLACES
+        # the set, so any entry that failed to read was deleted, and the code
+        # had to refuse domains with a malformed entry rather than risk
+        # destroying someone's mail routing.
         #
-        # Deliberately narrow: only transport and parse failures, which are
-        # the provider's problem with THIS domain. Any other exception type
-        # inside the try indicates a fault in this code and must propagate
-        # rather than be reported as a per-domain hiccup and skipped.
+        # Cloudflare creates routing rules INDIVIDUALLY. There is no set to
+        # read back, nothing to merge, and no way for this call to remove a
+        # rule it did not create - ensure_dev_route only ever matches a rule
+        # whose matcher is exactly dev@<this domain>. The entire read-merge-
+        # replace hazard, and the refusal that guarded it, are gone because
+        # the operation that caused them is gone.
         #
-        # A missing credential aborts for a second, independent reason:
-        # _api() is evaluated below while building params, outside the try,
-        # so a KeyError from it is never a candidate for this handler at all.
-        params = {**_api(), "Command": "namecheap.domains.dns.getEmailForwarding", "DomainName": domain}
-        try:
-            r = requests.get(API_URL, params=params, timeout=30)
-            root = ET.fromstring(r.text)
-        except (requests.exceptions.RequestException, ET.ParseError) as exc:
-            print(f"    ERROR reading forwards — {type(exc).__name__}: {exc}")
-            failed += 1
-            continue
+        # Namecheap is not dropped from the pipeline, only from DNS and mail:
+        # it remains the registrar that buys the domain and sets its
+        # nameservers.
+        route = cloudflare_dns.ensure_dev_route(
+            domain,
+            worker=worker or None,
+            forward_to=None if worker else assigned_email,
+            dry_run=dry_run,
+        )
+        status = str(route.get("status") or "unknown")
+        target = route.get("target") or assigned_email
 
-        if root.get("Status") == "ERROR":
-            errs = [e.text for e in root.findall(".//nc:Error", NS)]
-            if any("DNS" in (e or "") for e in errs):
-                print(f"    SKIP — external DNS")
-                skipped += 1
-                continue
-            print(f"    ERROR — {errs}")
-            failed += 1
-            continue
-
-        existing = [(fw.get("mailbox", ""), fw.text or "") for fw in root.findall(".//nc:Forward", NS)]
-
-        # setEmailForwarding REPLACES the whole set, so every entry read here
-        # has to be submitted back or it is deleted. This used to drop any
-        # entry with an empty mailbox or target and submit the remainder,
-        # which silently deleted it from the live configuration - a catch-all
-        # read back as mailbox="" would simply vanish, with nothing printed.
-        #
-        # Refuse the domain instead. A missing dev@ forward is recoverable by
-        # re-running; someone else's deleted mail routing is not. Same reason
-        # download_id_via_ui refuses rather than returning the wrong file.
-        malformed = [(mb, ft) for mb, ft in existing if not (mb and ft)]
-        if malformed:
-            print(f"    SKIP — {len(malformed)} existing forward(s) have an "
-                  f"empty mailbox or target: {malformed}. Refusing to rewrite "
-                  f"the set, which would delete them. Fix or remove them in "
-                  f"Namecheap, then re-run.")
-            skipped += 1
-            continue
-
-        if any(mb == "dev" for mb, _ in existing):
-            print(f"    OK — {dev_email} already set up")
-        else:
-            new_fwd = existing + [("dev", assigned_email)]
-            if dry_run:
-                print(f"    DRY — would create {dev_email} -> {assigned_email}")
-            else:
-                set_params = {**_api(), "Command": "namecheap.domains.dns.setEmailForwarding", "DomainName": domain}
-                for i, (mb, ft) in enumerate(new_fwd, 1):
-                    set_params[f"mailbox{i}"]   = mb
-                    set_params[f"ForwardTo{i}"] = ft
-                try:
-                    sr = requests.get(API_URL, params=set_params, timeout=30)
-                    sroot = ET.fromstring(sr.text)
-                except (requests.exceptions.RequestException,
-                        ET.ParseError) as exc:
-                    # Same reasoning as the read above. Note the forward may
-                    # or may not have been applied when the transport failed,
-                    # which is why the next run re-reads before deciding.
-                    print(f"    ERROR setting forwarding — "
-                          f"{type(exc).__name__}: {exc}")
-                    failed += 1
-                    continue
-                if sroot.get("Status") == "ERROR":
-                    errs = [e.text for e in sroot.findall(".//nc:Error", NS)]
-                    print(f"    ERROR setting forwarding — {errs}")
-                    failed += 1
-                    continue
+        if status == "dry_run":
+            print(f"    DRY — would {route.get('would')} {dev_email} -> {target}")
+        elif status == "configured":
+            if route.get("created"):
                 written += 1
-                print(f"    SET — {dev_email} -> {assigned_email}")
+                print(f"    SET — {dev_email} -> {target}")
+            else:
+                print(f"    OK  — {dev_email} already routed to {target}")
+        elif status == "not_delegated":
+            # The domain is still on its registrar's DNS. Not an error: the
+            # delegate stage has not reached it yet.
+            skipped += 1
+            print(f"    SKIP — {route.get('message') or 'not delegated'}")
+            continue
+        else:
+            # error, pending_verification, routing_not_ready. Each is a
+            # different operator action, so the status is printed as well as
+            # the reason.
+            failed += 1
+            print(f"    ERROR — {status}: "
+                  f"{route.get('message') or route.get('error') or 'no reason given'}")
+            continue
 
         # Update the manifest the build actually wrote. This read
         # pipeline_output/apps/<cn>/manifest.json, which nothing has ever
@@ -432,7 +389,7 @@ def stage_email(dry_run: bool = False) -> None:
         print(f"\n  [Dry run — nothing written] {len(companies)} considered, "
               f"{skipped} skipped, {failed} failed")
     else:
-        print(f"\n  {written} forward(s) created, {skipped} skipped, "
+        print(f"\n  {written} route(s) created, {skipped} skipped, "
               f"{failed} failed, of {len(companies)} considered.")
 
 
