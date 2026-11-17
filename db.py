@@ -67,6 +67,7 @@ COLUMNS: list[tuple[str, str]] = [
     ("Domain",                  "domain"),
     ("Domain Status",           "domain_status"),
     ("Domain Cost",             "domain_cost"),
+    ("DNS Delegation",          "dns_delegation"),
     ("Assigned Email",          "assigned_email"),
     ("Account Name",            "account_name"),
     ("Developer Email",         "developer_email"),

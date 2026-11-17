@@ -1173,6 +1173,7 @@ const STAGES = [
   { key: "duns",        label: "DUNS Number",         icon: "D" },
   { key: "certificate", label: "Certificate",         icon: "📄" },
   { key: "domain",      label: "Domain Registration", icon: "🌐" },
+  { key: "delegate",    label: "DNS Delegation",      icon: "🔗" },
   { key: "email",       label: "Email Assignment",    icon: "✉" },
   { key: "director_id", label: "Director ID",         icon: "🪪" },
   { key: "app",         label: "Android App",         icon: "📱" },
@@ -1225,6 +1226,7 @@ function stageDetail(key, d) {
     case "duns":        return d.duns ? `DUNS · ${d.duns}` : "";
     case "certificate": return d.stages?.certificate ? "✓ Downloaded" : "";
     case "domain":      return d.domain ? `Domain · ${d.domain}` : "";
+    case "delegate":    return d.dns_delegation ? `DNS · ${d.dns_delegation}` : "";
     case "email":       return d.email ? `Email · ${d.email}` : "";
     case "director_id": return d.stages?.director_id ? (d.directors ? d.directors.split(";")[0].trim() : "Generated") : "";
     case "app":         return d.stages?.app ? "✓ Built" : "";

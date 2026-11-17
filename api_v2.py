@@ -31,7 +31,8 @@ try:
 except Exception as _e:
     print(f"  [db] ensure_schema at import failed: {_e}")
 
-STAGE_ORDER = ["details", "duns", "certificate", "domain", "email", "director_id", "app"]
+STAGE_ORDER = ["details", "duns", "certificate", "domain", "delegate",
+               "email", "director_id", "app"]
 
 # UI field key -> spreadsheet/DB header label. Whitelist of manually-editable fields.
 # Editing any of these overrides the value the pipeline would otherwise produce;
@@ -58,6 +59,7 @@ EDITABLE_FIELDS = {
     "domain":               "Domain",
     "domain_status":        "Domain Status",
     "domain_cost":          "Domain Cost",
+    "dns_delegation":       "DNS Delegation",
     "email":                "Assigned Email",
     "account_name":         "Account Name",
     "developer_email":      "Developer Email",
@@ -335,6 +337,11 @@ def _compute_stages(cn: str, row: dict) -> dict:
         "duns":        bool(row.get("DUNS Number")),
         "certificate": has_cert,
         "domain":      bool(row.get("Domain")),
+        # Only "active" counts. "pending_activation" means the nameservers
+        # are set but Cloudflare has not seen them yet, so mail would not
+        # arrive - marking the stage done there is the silent-success bug.
+        "delegate":    str(row.get("DNS Delegation") or "").strip().lower()
+                       == "active",
         "email":       bool(row.get("Assigned Email")),
         "director_id": (cdir / "director_id" / "ID Front.jpeg").exists(),
         "app":         has_app,
@@ -701,6 +708,51 @@ def _exec_stage(cn: str, stage: str, row: dict):
               + (f": {result['error']}" if result.get("error") else ""))
         return result
 
+    elif stage == "delegate":
+        # Between buying a domain and configuring mail on it. Cloudflare
+        # cannot route mail for a zone it does not serve, so the email stage
+        # reports not_delegated until this has run.
+        domain = str(row.get("Domain") or "").strip()
+        if not domain:
+            print("  delegate: no domain on this company yet")
+            return {"status": "error",
+                    "error": "there is no Domain on this company, so there is "
+                             "nothing to delegate; the domain stage has not "
+                             "produced one yet"}
+        import delegate as _delegate
+        out = _delegate.delegate_domain(domain)
+        status = str(out.get("status") or "unknown")
+        _update_excel_row(cn, {"DNS Delegation": status})
+        nameservers = out.get("assigned_nameservers") or []
+        print(f"  delegate: {domain} -> "
+              f"{', '.join(nameservers) or '(no nameservers)'} ({status})")
+        # Always show what delegating threw away, successful or not. The
+        # registrar's records stop existing the moment the nameservers
+        # change, and an operator should never learn that afterwards.
+        for rec in out.get("records_discarded") or []:
+            print(f"    registrar record discarded: {rec.get('type')} "
+                  f"{rec.get('name')} -> {rec.get('address')}")
+        if status == "active":
+            return {"status": "done", "domain": domain,
+                    "zone_id": out.get("zone_id"),
+                    "nameservers": nameservers,
+                    "dns_delegation": status}
+        if status == "pending_activation":
+            # Not broken, not finished. "unresolved" is this codebase's word
+            # for that and it halts a run-all chain, which is right: the
+            # email stage after this one would configure a zone that cannot
+            # yet receive mail.
+            return {"status": "unresolved", "domain": domain,
+                    "zone_id": out.get("zone_id"),
+                    "nameservers": nameservers,
+                    "error": out.get("message") or
+                             f"{domain} is delegated but Cloudflare has not "
+                             f"seen the nameservers yet; re-run this stage "
+                             f"once the registry has propagated"}
+        return {"status": "error", "domain": domain,
+                "error": out.get("message") or out.get("error")
+                         or f"delegation of {domain} reported {status!r}"}
+
     elif stage == "email":
         from email_pool import EmailPool
         pool = EmailPool()
@@ -876,6 +928,7 @@ def v2_company(cn):
         "domain":           str(row.get("Domain") or ""),
         "domain_status":    str(row.get("Domain Status") or ""),
         "domain_cost":      str(row.get("Domain Cost") or ""),
+        "dns_delegation":   str(row.get("DNS Delegation") or ""),
         "email":            str(row.get("Assigned Email") or ""),
         "account_name":     str(row.get("Account Name") or ""),
         "developer_email":  str(row.get("Developer Email") or ""),
