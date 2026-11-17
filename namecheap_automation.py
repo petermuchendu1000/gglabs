@@ -971,18 +971,24 @@ def get_nameservers(domain_name):
             "using_registrar_dns": using_registrar_dns}
 
 
-# namecheap.domains.dns.setCustom's parameter encoding could NOT be confirmed
-# from Namecheap's own documentation: www.namecheap.com serves this
-# environment a bot challenge on every path, so the page was never read.
-# Secondary sources disagree - a search summary of the official page says a
-# single comma-separated "NameServers", while at least one real client sends
-# numbered Nameserver1/Nameserver2.
+# CONFIRMED 2026-11-17 against the live registrar: the encoding is a single
+# comma-separated "NameServers". simon-mwangi.site was delegated from
+# dns1/dns2.registrar-servers.com to houston/serena.ns.cloudflare.com on the
+# FIRST attempt, one API call, and the change survived the read-back.
 #
-# Guessing on a live domain is not acceptable: the failure mode is a domain
-# delegated to nothing, which is an outage with no error message. So both
-# encodings are tried IN ORDER and the result is VERIFIED BY READING BACK,
-# never by trusting the response. Whichever form the registrar actually
-# honours is the one that survives the read.
+# It was not confirmable beforehand. Namecheap's own documentation could not
+# be read - www.namecheap.com serves a Cloudflare bot challenge on every
+# path, including the site root - and secondary sources disagreed: a search
+# summary of the official page described this comma-separated form, while at
+# least one real client sends numbered Nameserver1/Nameserver2.
+#
+# The fallback stays anyway, for two reasons. Guessing on a live domain is
+# not acceptable - the failure mode is a domain delegated to nothing, an
+# outage with no error message - and one confirmation on one TLD is not a
+# guarantee for every TLD or for a future API revision. Both encodings are
+# tried IN ORDER and the result is VERIFIED BY READING BACK, never by
+# trusting the response. The confirmed form is first, so the normal path is
+# a single call.
 _SETCUSTOM_ENCODINGS = (
     ("NameServers", lambda hosts: {"NameServers": ",".join(hosts)}),
     ("Nameserver1..N", lambda hosts: {f"Nameserver{i}": h
