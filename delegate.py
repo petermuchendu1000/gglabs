@@ -78,8 +78,16 @@ def delegation_state(domain):
     """Where is this domain right now? READ-ONLY, writes nothing.
 
     {"registrar_nameservers": [...], "on_cloudflare": bool,
-     "zone_id": str|None, "zone_status": str|None, "active": bool}
+     "zone_id": str|None, "zone_status": str|None, "active": bool,
+     "zone_known": bool}
     or {"error": ...}.
+
+    zone_known is not decoration. When Cloudflare cannot be reached - no
+    credential, an outage - the registrar half still answers, so this returns
+    a useful partial result rather than throwing it away. But "active": False
+    would then mean "we could not ask", which reads identically to "the zone
+    is not active". zone_known=False marks that difference, and a caller
+    must check it before trusting `active`.
     """
     domain = (domain or "").strip().lower().rstrip(".")
     if not domain:
@@ -95,12 +103,15 @@ def delegation_state(domain):
 
     out = {"domain": domain, "registrar_nameservers": registrar_ns,
            "on_cloudflare": on_cf, "zone_id": None, "zone_status": None,
-           "active": False}
+           "active": False, "zone_known": False}
 
     zone = cloudflare_dns.find_zone(domain)
     if "error" in zone:
+        # Could not ASK. `active` stays False but zone_known stays False too,
+        # so nobody reads this as "the zone is not active".
         out["zone_lookup_error"] = zone["error"]
         return out
+    out["zone_known"] = True
     if zone.get("found"):
         out["zone_id"] = zone.get("zone_id")
         out["zone_status"] = zone.get("status")

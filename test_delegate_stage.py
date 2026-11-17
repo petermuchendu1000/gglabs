@@ -398,6 +398,46 @@ def check_wiring(r: Results) -> None:
             or "dns_delegation" in html, "no detail line for the stage")
 
 
+def check_delegation_state_reports_what_it_knows(r: Results) -> None:
+    """Observed live on the server: with no Cloudflare credential this
+    returned active=False alongside a zone_lookup_error. A caller reading
+    only `active` would conclude "not active" when the truth is "could not
+    ask" - the same conflation this codebase keeps removing."""
+    print("\n-- delegation_state separates 'not active' from 'could not ask' --")
+
+    class NoCloudflare(FakeCloudflare):
+        def find_zone(self, domain):
+            self.calls.append(("find_zone", domain))
+            return {"error": "Could not look up zone %s: "
+                             "CLOUDFLARE_API_TOKEN is not set" % domain}
+
+    nc, cf = with_doubles(FakeNamecheap(nameservers=CF_NS), NoCloudflare())
+    out = delegate.delegation_state(DOMAIN)
+    r.check("the registrar half still answers",
+            out.get("registrar_nameservers") == CF_NS, repr(out))
+    r.check("...and on_cloudflare is still correct",
+            out.get("on_cloudflare") is True, repr(out))
+    r.check("the zone is marked NOT known", out.get("zone_known") is False,
+            "active=False here means 'could not ask', and nothing says so")
+    r.check("...and the reason is carried",
+            "CLOUDFLARE_API_TOKEN" in str(out.get("zone_lookup_error", "")),
+            repr(out))
+
+    # A zone that genuinely is not there IS known.
+    nc, cf = with_doubles(FakeNamecheap(), FakeCloudflare(found=False))
+    out = delegate.delegation_state(DOMAIN)
+    r.check("a zone that really does not exist is KNOWN not to",
+            out.get("zone_known") is True and out.get("active") is False,
+            repr(out))
+
+    nc, cf = with_doubles(FakeNamecheap(nameservers=CF_NS),
+                          FakeCloudflare(found=True, active=True))
+    out = delegate.delegation_state(DOMAIN)
+    r.check("a live zone is known and active",
+            out.get("zone_known") is True and out.get("active") is True,
+            repr(out))
+
+
 def main() -> int:
     print("test_delegate_stage.py — moving a domain's DNS to Cloudflare")
     saved = (delegate.namecheap_automation, delegate.cloudflare_dns)
@@ -411,6 +451,7 @@ def main() -> int:
         check_failures_stop_before_damage(r)
         check_stage(r)
         check_wiring(r)
+        check_delegation_state_reports_what_it_knows(r)
     finally:
         delegate.namecheap_automation, delegate.cloudflare_dns = saved
     return r.report()

@@ -338,6 +338,25 @@ NAMECHEAP_SANDBOX=1      # keep 1 until you have deliberately tested live
 NAMECHEAP_DEFAULT_ADDRESS_ID=
 NAMECHEAP_REFERENCE_DOMAIN=
 
+# Cloudflare owns DNS and mail for every delegated domain; Namecheap stays
+# the registrar. Without these the delegate stage cannot create a zone and
+# the email stage cannot route dev@, so both fail with a clear message
+# rather than silently doing nothing.
+CLOUDFLARE_API_TOKEN=    # scoped token, NOT a Global API Key. Needs:
+                         #   Zone   > Zone            > Edit   (create zones)
+                         #   Zone   > DNS             > Edit   (TXT records)
+                         #   Zone   > Zone Settings   > Edit   (Email Routing)
+                         #   Zone   > Email Routing Rules > Edit
+                         #   Account> Email Routing Addresses > Edit
+                         #   Account> Account Analytics > Read (delivery log)
+CLOUDFLARE_ACCOUNT_ID=   # required to create a zone and to manage
+                         # account-level destination addresses
+CLOUDFLARE_EMAIL_WORKER= # optional. Unset: dev@ forwards to the company's
+                         # assigned mailbox, which Cloudflare will not
+                         # deliver to until a human verifies it once. Set to
+                         # a deployed Email Worker's script name: no
+                         # verification step at all.
+
 IBENTY_EMAIL=            # the ibenty.com account. The service used to be
 IBENTY_PASSWORD=         # xbinder.net; XBINDER_EMAIL / XBINDER_PASSWORD are
                          # still read if present, with a notice, so an older
