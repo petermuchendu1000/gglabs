@@ -716,6 +716,29 @@ def ensure_dev_route(domain, worker=None, forward_to=None, local_part="dev",
                              terminates inside our own system instead of
                              being handed to the same Google account that is
                              being verified.
+
+                             Two things were measured on a real delivery
+                             (2026-11-17, rawtest@simon-mwangi.site) before
+                             relying on this:
+
+                               * message.raw CAN be drained to completion and
+                                 a fetch() still issued in the same handler.
+                                 7106 of 7106 bytes read, then GET to the
+                                 pipeline's own /health returned 200 in 658ms
+                                 with a live response body. This was the one
+                                 undocumented assumption the Worker route
+                                 rests on.
+                               * A verification code must be pulled from the
+                                 PARSED body, never by scanning the raw MIME.
+                                 Searching the whole message for 4-8 digit
+                                 runs returned 2607, 4864, 2607, 4864 ... -
+                                 fragments of the sender's IPv6 address
+                                 (2607:f8b0:4864:20::132c) in the Received
+                                 headers, plus date stamps. The headers are
+                                 full of digit runs and none of them is a
+                                 code. Parse the MIME, take text/plain (the
+                                 test message also carried text/html), and
+                                 search only there.
       forward_to=<address>   like-for-like with the old Namecheap behaviour,
                              but Cloudflare will not deliver to an address a
                              human has not verified by clicking a link in it.
