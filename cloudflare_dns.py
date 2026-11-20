@@ -63,6 +63,14 @@ the module exists in this shape.
 CREDENTIALS
     CLOUDFLARE_API_TOKEN   required for every live call
     CLOUDFLARE_ACCOUNT_ID  required to create a zone; optional elsewhere
+
+    DO NOT use GET /user/tokens/verify to check a token. Measured 2026-11-20
+    against a working `cfat_`-prefixed scoped token: verify answers
+    1000 "Invalid API Token" while that same token succeeds on every call
+    this module makes - zones, dns_records (read AND write), email routing,
+    destination addresses and the GraphQL analytics. A failing verify proves
+    nothing about a token; it has already sent two debugging attempts down a
+    false trail here. Test a token with the call you actually need.
 Both are read at CALL time, not at import, so a .env loaded later still
 works and so tests can set them. A scoped token is enough: zone creation
 needs Zone:Edit or DNS:Edit, the activation check needs Zone:Write, records
