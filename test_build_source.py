@@ -240,6 +240,98 @@ def check_callers(r: Results) -> None:
             "the default must be the database")
 
 
+def check_gradle_output_is_relayed(r: Results) -> None:
+    """A failing build must say WHY, wherever it is being watched from.
+
+    Observed on the server: the app stage reported "Gradle exit=1 in 0.0s"
+    and nothing else. run_gradle used subprocess.run with no pipes, which
+    hands the child the real file descriptors - while api_v2 captures a
+    stage's output by replacing sys.stdout, a Python-level object that leaves
+    fd 1 alone. So every line Gradle wrote went to the service journal and the
+    job drawer showed a failure with no reason. The reason had been printed,
+    to somewhere nobody was reading.
+    """
+    import io
+    import types
+    from contextlib import redirect_stdout
+
+    from apps.generator import generate
+
+    print("\n-- a failing Gradle run explains itself --")
+
+    class _C:
+        company_number = "1"
+        company_name = "X"
+        flavor = "c1"
+
+    def run_with(script: str) -> tuple[int, str]:
+        d = tempfile.mkdtemp()
+        g = os.path.join(d, "gradlew")
+        with open(g, "w", encoding="utf-8") as f:
+            f.write(script)
+        os.chmod(g, 0o755)
+        saved = generate.TEMPLATE_ROOT
+        generate.TEMPLATE_ROOT = d
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                code = generate.run_gradle(
+                    [types.SimpleNamespace(company=_C())])
+            return code, buf.getvalue()
+        finally:
+            generate.TEMPLATE_ROOT = saved
+
+    # What the server actually did: non-zero, instantly, in total silence.
+    code, out = run_with("#!/bin/sh\nexit 1\n")
+    r.check("a silent non-zero exit is reported as such", code == 1,
+            f"exit {code}")
+    r.check("...and is explicitly NOT called a compile error",
+            "no output at all" in out and "nothing was compiled" in out,
+            f"the operator is left guessing: {out!r}")
+    r.check("...and a command to reproduce it is given",
+            "--no-daemon --version" in out, repr(out))
+
+    # The control: a wrapper that DOES speak must have its words relayed
+    # through print(), which is what the dashboard's stdout capture sees.
+    code, out = run_with(
+        '#!/bin/sh\necho "Could not reserve enough space" >&2\nexit 1\n')
+    r.check("stderr from the wrapper is relayed",
+            "Could not reserve enough space" in out,
+            "the reason is still invisible from the dashboard: " + repr(out))
+    r.check("...and that run is not mislabelled as silent",
+            "no output at all" not in out,
+            "a build that explained itself was reported as saying nothing")
+
+    code, out = run_with('#!/bin/sh\necho "BUILD SUCCESSFUL"\nexit 0\n')
+    r.check("a successful run relays its output too and returns 0",
+            code == 0 and "BUILD SUCCESSFUL" in out, f"{code} {out!r}")
+
+    # A wrapper that cannot be executed must return 1, not raise: it used to
+    # escape as an uncaught exception from inside a worker thread.
+    d = tempfile.mkdtemp()
+    g = os.path.join(d, "gradlew")
+    with open(g, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(g, 0o600)                      # present, not executable
+    saved = generate.TEMPLATE_ROOT
+    generate.TEMPLATE_ROOT = d
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            code = generate.run_gradle([types.SimpleNamespace(company=_C())])
+    except Exception as e:                  # noqa: BLE001
+        code, buf = None, io.StringIO()
+        r.check("a non-executable wrapper does not raise", False,
+                f"{type(e).__name__}: {e}")
+    finally:
+        generate.TEMPLATE_ROOT = saved
+    if code is not None:
+        r.check("a non-executable wrapper returns 1 instead of raising",
+                code == 1, f"exit {code}")
+        r.check("...and names the file and the errno",
+                "could not start" in buf.getvalue(), repr(buf.getvalue()))
+
+
 def main() -> int:
     r = Results()
     print(f"target: apps/generator/catalog.load_companies (stage 5's source)")
@@ -248,6 +340,7 @@ def main() -> int:
     check_fields(r)
     check_filters(r)
     check_callers(r)
+    check_gradle_output_is_relayed(r)
     return r.report()
 
 

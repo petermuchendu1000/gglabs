@@ -96,10 +96,49 @@ def run_gradle(built: list[BuiltFlavor], variant: str = "Release", artifact: str
     cmd = [gradlew, "--no-daemon", "--console=plain", "--stacktrace", *tasks]
     print(f"\n  Gradle: {' '.join(tasks)}")
     t0 = time.time()
-    res = subprocess.run(cmd, cwd=TEMPLATE_ROOT)
+
+    # Gradle's output is RELAYED through print(), not inherited.
+    #
+    # subprocess.run(cmd) with no pipes hands the child the real file
+    # descriptors. api_v2 captures a stage's output by replacing sys.stdout,
+    # which is a Python-level object - fd 1 is untouched - so every line
+    # Gradle wrote went to the service's journal and the job drawer showed
+    # only "Gradle exit=1". That is how a build that died in 0.0s, before it
+    # compiled anything, arrived as a failure with no reason attached: the
+    # reason had been printed, to somewhere nobody was reading.
+    #
+    # Line by line rather than capture-then-print, so a ten-minute build
+    # still shows progress instead of going silent until it ends.
+    lines: list[str] = []
+    try:
+        proc = subprocess.Popen(cmd, cwd=TEMPLATE_ROOT, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                bufsize=1)
+    except OSError as e:
+        # errno 13 without the exec bit, errno 8 for a bad format. Both used
+        # to escape as an uncaught exception from inside a worker thread.
+        print(f"  ERROR: could not start {gradlew}: {e}")
+        return 1
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        lines.append(line)
+        print(f"    | {line}")
+    code = proc.wait()
     dt = time.time() - t0
-    print(f"  Gradle exit={res.returncode} in {dt:.1f}s")
-    return res.returncode
+    print(f"  Gradle exit={code} in {dt:.1f}s")
+
+    if code != 0 and not lines:
+        # A non-zero exit with NOTHING on either stream. The JVM does this
+        # when it cannot reserve its heap, and it is over in milliseconds -
+        # which looks identical to "the wrapper never ran". Say which.
+        print("  Gradle produced no output at all before exiting "
+              f"{code} in {dt:.1f}s.")
+        print("  That is not a compile error: nothing was compiled. A JVM "
+              "that cannot reserve its heap exits like this.")
+        print(f"  Reproduce it directly with:  cd {TEMPLATE_ROOT} && "
+              f"./gradlew --no-daemon --version")
+    return code
 
 
 def _co_dir(c) -> str:

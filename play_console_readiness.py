@@ -281,18 +281,23 @@ def build_readiness_record(result: dict) -> dict:
                 "from": developer_email,
                 "to": account_email,
                 "status": _clean(forwarding.get("status")) or "not_configured",
-                "provider": "Namecheap email forwarding",
+                # Namecheap forwarding cannot survive the delegation this
+                # pipeline performs - it requires Namecheap DNS, and these
+                # domains point at Cloudflare. Saying "Namecheap" here
+                # described a route that no longer exists, in a document whose
+                # whole job is to tell a human what is true.
+                "provider": "Cloudflare Email Routing (worker rule)",
                 "can_receive": bool(developer_email and account_email),
                 "can_send": False,
-                "note": "Namecheap forwarding receives mail only; use Private Email/SMTP if sending as dev@domain is required.",
+                "note": "Receives only. A Worker rule needs no per-company destination verification, which a plain forward does.",
             },
         },
         "dns_verification": {
             "google_txt_host": _clean(txt.get("hostname")) or "@",
             "google_txt_value": _clean(txt.get("value")) or "PENDING_HUMAN_GOOGLE_TOKEN",
             "status": _clean(txt.get("status")) or "token_pending",
-            "provider": "Namecheap DNS setHosts",
-            "note": "Human copies TXT token from Google; pipeline can apply it to Namecheap DNS only.",
+            "provider": "Cloudflare DNS",
+            "note": "Human copies the TXT token from Google; the pipeline writes it to the Cloudflare zone.",
         },
         "documents": {
             "certificate_path": certificate_path,
@@ -306,6 +311,18 @@ def build_readiness_record(result: dict) -> dict:
             "billing_profile_note": "Google Payments profile legal name/address should match D&B and Companies House as closely as possible.",
         },
     }
+    # Play Console's App content declarations, derived from what the app
+    # actually is rather than stored as constants. Kept OUT of
+    # _readiness_summary: that summary answers "can a human open the account
+    # yet", and these answer "what does a human tick once the app is
+    # uploaded". Folding them together would let an app-content gap read as
+    # an account problem, and vice versa.
+    import play_declarations
+    record["declarations"] = play_declarations.declarations_for(
+        privacy_policy_url=_clean(play.get("privacy_policy_url")),
+        support_email=developer_email,
+    )
+
     record["readiness"] = _readiness_summary(record)
     return record
 

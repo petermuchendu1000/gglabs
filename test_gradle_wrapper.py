@@ -147,9 +147,24 @@ def check_selection(r: Results) -> None:
 
     recorded: list[list[str]] = []
 
-    def fake_run(cmd, **kw):
+    # run_gradle used subprocess.run and now uses Popen, so that Gradle's
+    # output can be RELAYED through print() instead of inherited: api_v2
+    # captures a stage by replacing sys.stdout, which leaves fd 1 alone, so an
+    # inherited stream goes to the journal and the job drawer shows only an
+    # exit code. This double must follow that change, and when it did not, the
+    # patch stopped intercepting and this test shelled out to a real nine
+    # second Gradle build - which is how the change was noticed.
+    class FakeProc:
+        def __init__(self, lines=("BUILD SUCCESSFUL\n",), code=0):
+            self.stdout = iter(lines)
+            self._code = code
+
+        def wait(self):
+            return self._code
+
+    def fake_popen(cmd, **kw):
         recorded.append(list(cmd))
-        return types.SimpleNamespace(returncode=0)
+        return FakeProc()
 
     # Collect inside the patched block, assert outside it. pathlib picks
     # WindowsPath vs PosixPath from os.name at call time, so touching Path()
@@ -157,9 +172,9 @@ def check_selection(r: Results) -> None:
     # though not on 3.13, which is how this first passed and then failed.
     # Only string operations are used below for the same reason.
     results: list[tuple[str, int, list[str]]] = []
-    saved_run, saved_name = gen.subprocess.run, os.name
+    saved_run, saved_name = gen.subprocess.Popen, os.name
     try:
-        gen.subprocess.run = fake_run
+        gen.subprocess.Popen = fake_popen
         for name in ("posix", "nt"):
             recorded.clear()
             os.name = name
@@ -167,7 +182,7 @@ def check_selection(r: Results) -> None:
                                 variant="Release", artifact="aab")
             results.append((name, rc, list(recorded[0]) if recorded else []))
     finally:
-        gen.subprocess.run = saved_run
+        gen.subprocess.Popen = saved_run
         os.name = saved_name
 
     for (name, rc, argv), want in zip(results, ("gradlew", "gradlew.bat")):
