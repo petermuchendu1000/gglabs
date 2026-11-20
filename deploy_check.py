@@ -23,7 +23,10 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata as md
 import os
+import re
+import shutil
 import stat
+import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -297,6 +300,18 @@ def owner_only(mode: int) -> bool:
     return not (mode & (stat.S_IRGRP | stat.S_IROTH))
 
 
+def owner_only_exec(mode: int) -> bool:
+    """Can only the owner EXECUTE this? Then the service user cannot.
+
+    The same trap as owner_only and it caught this file out: the first version
+    of the Gradle wrapper check used os.access(X_OK), which as root returns
+    True when merely u+x is set - so a wrapper the service user cannot exec
+    would have passed, and run_gradle would raise errno 13 exactly as it did
+    for delegate.py.
+    """
+    return not (mode & (stat.S_IXGRP | stat.S_IXOTH))
+
+
 def world_readable(mode: int) -> bool:
     """Can anybody on the box read this? Correct for source, not for .env."""
     return bool(mode & stat.S_IROTH)
@@ -364,6 +379,124 @@ def check_source_readable() -> None:
                if world_readable(mode) else f"mode {oct(mode & 0o777)}")
 
 
+def java_major(version_output: str) -> int | None:
+    """The major version from `java -version` output, or None.
+
+    Two formats, because Java changed its scheme at 9: 'openjdk version
+    "17.0.13"' is 17, and 'java version "1.8.0_392"' is 8, not 1. Reading the
+    first component of the latter gives 1, which compares as older than
+    everything and would report a usable JDK as unusable - or, with the
+    comparison the other way, an unusable one as fine.
+    """
+    m = re.search(r'version "([0-9][0-9._]*)', version_output or "")
+    if not m:
+        return None
+    parts = m.group(1).split(".")
+    try:
+        if parts[0] == "1" and len(parts) > 1:
+            return int(parts[1])
+        return int(parts[0])
+    except ValueError:
+        return None
+
+
+def required_compile_sdk() -> int | None:
+    """compileSdk from the app template, so this check cannot go stale.
+
+    Hardcoding 35 here would keep passing after somebody bumps the template,
+    and the build would then fail on the server for a platform nobody checked
+    for.
+    """
+    path = os.path.join(ROOT, "apps", "template-shift-journal", "app",
+                        "build.gradle.kts")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return None
+    m = re.search(r"compileSdk\s*=\s*(\d+)", text)
+    return int(m.group(1)) if m else None
+
+
+def check_build_toolchain() -> None:
+    """What the app stage needs, checked before the app stage needs it.
+
+    Observed 2026-11-20: a run reached the app stage - every earlier stage
+    green - and died on
+
+      FileNotFoundError: keytool not found - install a JDK or set JAVA_HOME
+
+    raised from keystore_mint, which signs every flavour. The whole chain had
+    to run, including a billed domain purchase, to discover a missing package.
+    Nothing before this section asked whether the build toolchain existed.
+
+    The Android SDK is checked too, because it is the very next thing that
+    would have failed: generate.py writes local.properties from ANDROID_HOME
+    and defaults it to ~/Android/Sdk, a path a systemd service user does not
+    normally have.
+    """
+    section("9. App build toolchain (the app stage)")
+
+    keytool = shutil.which("keytool")
+    record("keytool is on PATH", "PASS" if keytool else "FAIL",
+           keytool or "keystore_mint cannot sign anything; install a JDK")
+
+    java = shutil.which("java")
+    if not java:
+        record("java is on PATH", "FAIL", "Gradle cannot run")
+    else:
+        record("java is on PATH", "PASS", java)
+        try:
+            p = subprocess.run([java, "-version"], capture_output=True,
+                               text=True, timeout=30)
+            major = java_major(p.stderr + p.stdout)
+        except Exception as e:                  # pragma: no cover - defensive
+            major = None
+            record("java -version could be read", "FAIL", str(e))
+        if major is not None:
+            # AGP 8.7.3 and jvmTarget 17 in the template. 17 is the floor.
+            record("java is 17 or newer (AGP 8.7.3 needs 17)",
+                   "PASS" if major >= 17 else "FAIL", f"found {major}")
+
+    sdk = (os.environ.get("ANDROID_HOME")
+           or os.environ.get("ANDROID_SDK_ROOT") or "")
+    if not sdk:
+        record("ANDROID_HOME or ANDROID_SDK_ROOT is set", "FAIL",
+               "generate.py falls back to ~/Android/Sdk, which a service "
+               "user does not have")
+        return
+    record("ANDROID_HOME or ANDROID_SDK_ROOT is set", "PASS", sdk)
+    if not os.path.isdir(sdk):
+        record("the SDK directory exists", "FAIL", sdk)
+        return
+    record("the SDK directory exists", "PASS")
+
+    want = required_compile_sdk()
+    if want is None:
+        record("compileSdk could be read from the template", "FAIL",
+               "cannot tell which platform the build needs, so the platform "
+               "check below would be vacuous")
+    else:
+        plat = os.path.join(sdk, "platforms", f"android-{want}")
+        record(f"platforms/android-{want} is installed",
+               "PASS" if os.path.isdir(plat) else "FAIL", plat)
+
+    bt = os.path.join(sdk, "build-tools")
+    versions = sorted(os.listdir(bt)) if os.path.isdir(bt) else []
+    record("build-tools is installed", "PASS" if versions else "FAIL",
+           ", ".join(versions) or bt)
+
+    gradlew = os.path.join(ROOT, "apps", "template-shift-journal", "gradlew")
+    if not os.path.exists(gradlew):
+        record("the Gradle wrapper is present", "FAIL", gradlew)
+    else:
+        record("the Gradle wrapper is present", "PASS")
+        gmode = os.stat(gradlew).st_mode
+        record("...and is executable by the service user",
+               "FAIL" if owner_only_exec(gmode) else "PASS",
+               f"mode {oct(gmode & 0o777)} - run_gradle execs it directly, "
+               f"so without the bit it raises errno 13")
+
+
 def main() -> int:
     print("Deployment self-check - read-only, changes nothing")
     print(f"repo: {ROOT}")
@@ -376,6 +509,7 @@ def main() -> int:
     check_database()
     check_app_imports()
     check_source_readable()
+    check_build_toolchain()
 
     failed = [n for n, s, _ in RESULTS if s == "FAIL"]
     skipped = [n for n, s, _ in RESULTS if s == "SKIP"]

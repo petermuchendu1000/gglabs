@@ -283,6 +283,19 @@ def check_permission_predicates(r: Results) -> None:
                 deploy_check.world_readable(mode) is expect,
                 "the .env half of the guard turns on this")
 
+    # The exec counterpart, for the Gradle wrapper. Same trap, and it caught
+    # the first version of the toolchain check, which used os.access(X_OK).
+    for mode, expect, why in (
+        (0o700, True,  "u+x only: root can exec it, the service user cannot"),
+        (0o744, True,  "readable by all but executable only by the owner"),
+        (0o755, False, "the normal mode for a wrapper script"),
+        (0o750, False, "group-executable, which a service user can be given"),
+        (0o711, False, "other-executable"),
+        (0o644, True,  "not executable by anybody but reported as owner-only"),
+    ):
+        r.check(f"owner_only_exec({oct(mode)}) is {expect}",
+                deploy_check.owner_only_exec(mode) is expect, why)
+
     # The guard must not be access-based. Parsed, not grepped: the docstring
     # above says the words "os.access" and a grep would trip on the prose.
     tree = ast.parse(Path(deploy_check.__file__).read_text(encoding="utf-8"))
@@ -316,6 +329,110 @@ def check_permission_predicates(r: Results) -> None:
             "the check would report thousands of dependency files")
 
     check_the_guard_fires(r, deploy_check)
+    check_java_version_parsing(r, deploy_check)
+    check_toolchain_guard_fires(r, deploy_check)
+
+
+def check_java_version_parsing(r: Results, deploy_check) -> None:
+    """`java -version` has two schemes and the old one is a trap.
+
+    'java version "1.8.0_392"' is Java 8. Reading the leading component gives
+    1, which compares older than every floor and reports a working JDK as
+    unusable - or, with the comparison written the other way, reports Java 8
+    as new enough to run AGP 8.7.3, which needs 17.
+    """
+    print("\n-- java -version parsing --")
+    for text, expect, why in (
+        ('openjdk version "17.0.13" 2024-10-15', 17, "the version to install"),
+        ('openjdk version "21.0.5" 2024-10-15', 21, "newer is fine"),
+        ('java version "1.8.0_392"', 8, "the old scheme: 1.8 is 8, not 1"),
+        ('java version "1.7.0_80"', 7, "older still, and must read as 7"),
+        ('openjdk version "11.0.25"', 11, "below the floor but parseable"),
+        ('openjdk version "25"', 25, "no minor component at all"),
+        ("Picked up JAVA_TOOL_OPTIONS: -Xmx1g\n"
+         'openjdk version "17.0.13"', 17, "a noisy first line is common"),
+    ):
+        r.check(f"java_major reads {expect} from {text.splitlines()[-1]!r}",
+                deploy_check.java_major(text) == expect, why)
+
+    for junk in ("", "command not found", "no version here", None):
+        r.check(f"java_major({junk!r}) is None",
+                deploy_check.java_major(junk) is None,
+                "unparseable output must not become a number, which would be "
+                "compared against the floor and silently pass or fail")
+
+    # The floor comes from the template, not from this test.
+    sdk = deploy_check.required_compile_sdk()
+    r.check("compileSdk is read from the app template", sdk == 35,
+            f"got {sdk!r}; a hardcoded platform check goes stale the moment "
+            f"somebody bumps the template")
+
+
+def check_toolchain_guard_fires(r: Results, deploy_check) -> None:
+    """The toolchain section must FAIL on the real server state and PASS on a
+    complete one. Without the second half it could be a section that always
+    fails, which gets ignored."""
+    print("\n-- the build-toolchain guard, both directions --")
+    import io
+    from contextlib import redirect_stdout
+
+    def run(env):
+        saved_results = deploy_check.RESULTS
+        saved_env = {k: os.environ.get(k) for k in
+                     ("ANDROID_HOME", "ANDROID_SDK_ROOT")}
+        deploy_check.RESULTS = []
+        for k in saved_env:
+            os.environ.pop(k, None)
+        os.environ.update({k: v for k, v in env.items() if v})
+        try:
+            with redirect_stdout(io.StringIO()):
+                deploy_check.check_build_toolchain()
+            return [f"{n}: {d}" for n, s, d in deploy_check.RESULTS
+                    if s == "FAIL"]
+        finally:
+            deploy_check.RESULTS = saved_results
+            for k in saved_env:
+                os.environ.pop(k, None)
+            for k, v in saved_env.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    # No ANDROID_HOME at all - the state of a fresh server.
+    fails = run({})
+    r.check("an unset ANDROID_HOME is reported FAILED",
+            any("ANDROID_HOME" in f for f in fails),
+            f"generate.py would silently use ~/Android/Sdk: {fails!r}")
+
+    # Pointed at a directory that is not an SDK.
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        fails = run({"ANDROID_HOME": str(tmp)})
+        r.check("a missing platforms/android-35 is reported FAILED",
+                any("android-35" in f for f in fails), repr(fails))
+        r.check("missing build-tools is reported FAILED",
+                any("build-tools" in f for f in fails), repr(fails))
+
+        # And the control: a complete-looking SDK clears both of those.
+        sdk = deploy_check.required_compile_sdk()
+        (tmp / "platforms" / f"android-{sdk}").mkdir(parents=True)
+        (tmp / "build-tools" / "35.0.0").mkdir(parents=True)
+        fails = run({"ANDROID_HOME": str(tmp)})
+        r.check("a complete SDK clears the platform check",
+                not any("android-" in f for f in fails), repr(fails))
+        r.check("...and the build-tools check",
+                not any("build-tools" in f for f in fails),
+                "the guard fails on a correct SDK, so it would be ignored")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # keytool: whichever way this container is, the check must agree with
+    # reality rather than being hardcoded.
+    import shutil as _sh
+    fails = run({"ANDROID_HOME": "/nonexistent-sdk-path"})
+    has_keytool = _sh.which("keytool") is not None
+    r.check("the keytool check matches whether keytool exists",
+            any("keytool" in f for f in fails) is not has_keytool,
+            f"keytool present={has_keytool}, failures={fails!r}")
 
 
 def check_the_guard_fires(r: Results, deploy_check) -> None:
