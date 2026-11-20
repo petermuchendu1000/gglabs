@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata as md
 import os
+import stat
 import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -284,6 +285,85 @@ def check_app_imports() -> None:
            "PASS" if not bad else "FAIL", "; ".join(bad))
 
 
+def owner_only(mode: int) -> bool:
+    """Can only the owner read this? Then no non-root service user can.
+
+    Deliberately decided from the MODE BITS, never from os.access(). As root
+    os.access() returns True for a 0600 file owned by somebody else, so an
+    access-based check passes for the very fault it is meant to catch - and
+    deploy_check is usually run as root. A check that cannot fail where it is
+    run is not a check.
+    """
+    return not (mode & (stat.S_IRGRP | stat.S_IROTH))
+
+
+def world_readable(mode: int) -> bool:
+    """Can anybody on the box read this? Correct for source, not for .env."""
+    return bool(mode & stat.S_IROTH)
+
+
+def _source_files() -> list[str]:
+    skip = {".git", ".venv", "venv", "__pycache__", "node_modules",
+            "pipeline_output", "logs"}
+    out = []
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        for f in filenames:
+            if f.endswith((".py", ".js", ".html")):
+                out.append(os.path.join(dirpath, f))
+    return sorted(out)
+
+
+def check_source_readable() -> None:
+    """Every source file must be readable by the user the service runs as.
+
+    THIS IS NOT HYPOTHETICAL. Observed 2026-11-20: the delegate stage failed
+    from the dashboard with PermissionError on delegate.py while the same
+    import worked perfectly from the console - because the console was root,
+    and root ignores file modes. `git pull` under a umask of 077 creates new
+    files 0600, so every module added by a deploy is unreadable by the service
+    while every older one keeps working. The failure surfaces as a traceback
+    inside one stage, which reads like a code fault and is not one.
+
+    The .env check is the other half, and it is here on purpose: the fix for
+    the fault above is a chmod, and `chmod -R a+r` over the repo would make
+    the database password and every API key readable by any account on the
+    box. One of these two checks catches the bug and the other catches the
+    careless fix.
+    """
+    section("8. Source file permissions")
+    if os.geteuid() == 0:
+        # Not a failure - just the reason this check reads modes rather than
+        # asking whether IT can open the files.
+        record("running as root, so modes are read directly", "PASS",
+               "os.access() would pass for every file here")
+
+    files = _source_files()
+    if not files:
+        record("source files found to check", "FAIL",
+               "nothing was walked, so every check below is vacuous")
+        return
+    record(f"{len(files)} source files found", "PASS")
+
+    unreadable = [os.path.relpath(p, ROOT) for p in files
+                  if owner_only(os.stat(p).st_mode)]
+    record("every source file is readable by non-owner",
+           "FAIL" if unreadable else "PASS",
+           ("owner-only, so the service cannot import: "
+            + ", ".join(unreadable[:12])) if unreadable else "")
+
+    env = os.path.join(ROOT, ".env")
+    if not os.path.exists(env):
+        record(".env is not world-readable", "SKIP", "no .env file")
+    else:
+        mode = os.stat(env).st_mode
+        record(".env is not world-readable",
+               "FAIL" if world_readable(mode) else "PASS",
+               f"mode {oct(mode & 0o777)} - every account on this box can "
+               f"read the database password and every API key"
+               if world_readable(mode) else f"mode {oct(mode & 0o777)}")
+
+
 def main() -> int:
     print("Deployment self-check - read-only, changes nothing")
     print(f"repo: {ROOT}")
@@ -295,6 +375,7 @@ def main() -> int:
     check_browser(have_display)
     check_database()
     check_app_imports()
+    check_source_readable()
 
     failed = [n for n, s, _ in RESULTS if s == "FAIL"]
     skipped = [n for n, s, _ in RESULTS if s == "SKIP"]

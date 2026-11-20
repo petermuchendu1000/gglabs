@@ -27,6 +27,7 @@ has already had twice, in the scorer and in the output path.
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import sys
 import subprocess
@@ -243,6 +244,143 @@ def check_caddyfile(r: Results) -> None:
                 "the other security headers must not be lost in the edit")
 
 
+def check_permission_predicates(r: Results) -> None:
+    """deploy_check's permission guard, and the reason it reads mode bits.
+
+    Observed on the server 2026-11-20: the delegate stage died with
+    PermissionError on delegate.py from the dashboard while the identical
+    import succeeded from the console. The console was root. `git pull` under
+    a umask of 077 writes new files 0600, so every module a deploy ADDS is
+    unreadable by the service user while every older one keeps working.
+
+    The guard therefore must not be written with os.access(): run as root -
+    which is how deploy_check is normally run - os.access() returns True for
+    a 0600 file owned by anybody, so it would pass for exactly the fault it
+    exists to find. That is checked here by parsing the module, because a
+    guard that cannot fail where it runs is not a guard.
+    """
+    print("\n-- deploy_check's source-permission guard --")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import ast
+
+    import deploy_check
+
+    # 0600 and 0700 are the real fault: owner-only.
+    for mode, expect, why in (
+        (0o600, True,  "git pull under umask 077 produces exactly this"),
+        (0o700, True,  "owner-only even though it is executable"),
+        (0o640, False, "group-readable, which a service user can be given"),
+        (0o644, False, "the normal mode for source"),
+        (0o604, False, "other-readable without group"),
+        (0o664, False, "group and other readable"),
+    ):
+        r.check(f"owner_only({oct(mode)}) is {expect}",
+                deploy_check.owner_only(mode) is expect, why)
+
+    for mode, expect in ((0o644, True), (0o604, True), (0o640, False),
+                         (0o600, False), (0o660, False)):
+        r.check(f"world_readable({oct(mode)}) is {expect}",
+                deploy_check.world_readable(mode) is expect,
+                "the .env half of the guard turns on this")
+
+    # The guard must not be access-based. Parsed, not grepped: the docstring
+    # above says the words "os.access" and a grep would trip on the prose.
+    tree = ast.parse(Path(deploy_check.__file__).read_text(encoding="utf-8"))
+    calls = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Attribute):
+                calls.add(f.attr)
+            elif isinstance(f, ast.Name):
+                calls.add(f.id)
+    r.check("the module parsed and calls were found", len(calls) > 10,
+            f"only {sorted(calls)!r}; every check below would be vacuous")
+    r.check("deploy_check never calls os.access", "access" not in calls,
+            "as root os.access passes for a 0600 file owned by another user, "
+            "so the guard would pass for the fault it exists to catch")
+    r.check("...and does read st_mode", "stat" in calls,
+            "the guard has no way to see the mode bits")
+
+    # The walk must actually find this repository's own source.
+    files = deploy_check._source_files()
+    names = {os.path.basename(p) for p in files}
+    for expected in ("deploy_check.py", "delegate.py", "cloudflare_dns.py",
+                     "api_v2.py"):
+        r.check(f"the walk finds {expected}", expected in names,
+                f"{len(files)} files found; a module left out is a module "
+                f"whose permissions are never checked")
+    r.check("the walk skips .venv and .git",
+            not any(os.sep + d + os.sep in p
+                    for p in files for d in (".venv", ".git")),
+            "the check would report thousands of dependency files")
+
+    check_the_guard_fires(r, deploy_check)
+
+
+def check_the_guard_fires(r: Results, deploy_check) -> None:
+    """The predicates being right proves nothing about the guard being WIRED.
+
+    So run check_source_readable over a directory built to contain the real
+    fault, and then over the same directory without it. Both directions,
+    because a guard that FAILs on everything would pass the first half.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    def run(mode: int, env_mode: int | None = None):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            good = tmp / "fine.py"
+            good.write_text("x = 1\n", encoding="utf-8")
+            good.chmod(0o644)
+            bad = tmp / "delegate.py"
+            bad.write_text("y = 2\n", encoding="utf-8")
+            bad.chmod(mode)
+            if env_mode is not None:
+                env = tmp / ".env"
+                env.write_text("SECRET=hunter2\n", encoding="utf-8")
+                env.chmod(env_mode)
+            saved_root, saved_results = deploy_check.ROOT, deploy_check.RESULTS
+            deploy_check.ROOT = str(tmp)
+            deploy_check.RESULTS = []
+            try:
+                with redirect_stdout(io.StringIO()):
+                    deploy_check.check_source_readable()
+                return list(deploy_check.RESULTS)
+            finally:
+                deploy_check.ROOT = saved_root
+                deploy_check.RESULTS = saved_results
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def failures(results):
+        return [f"{n}: {d}" for n, s, d in results if s == "FAIL"]
+
+    bad = failures(run(0o600))
+    r.check("a 0600 source file is reported FAILED", len(bad) == 1,
+            f"the real server fault went unreported: {bad!r}")
+    r.check("...and the offending file is named",
+            any("delegate.py" in f for f in bad),
+            f"an operator cannot act on this: {bad!r}")
+
+    # The control. Without it the check above passes for a guard that fails
+    # on every directory it is ever given.
+    r.check("the same directory at 0644 reports NO failure",
+            failures(run(0o644)) == [],
+            "the guard fails on correctly-permissioned source, so it would "
+            "be switched off within a week")
+
+    # And the other half: the careless fix for the fault above.
+    r.check("a world-readable .env is reported FAILED",
+            any(".env" in f for f in failures(run(0o644, env_mode=0o644))),
+            "chmod -R a+r over the repo would expose the database password "
+            "and every API key, and this check is what notices")
+    r.check("a 0600 .env reports no failure",
+            failures(run(0o644, env_mode=0o600)) == [],
+            "the correct mode for .env is reported as a problem")
+
+
 def main() -> int:
     r = Results()
     print(f"target: the .env-rewriting scripts in {DEPLOY}")
@@ -260,6 +398,7 @@ def main() -> int:
         check_script(r, script)
         check_prompt_safety(r, script)
     check_caddyfile(r)
+    check_permission_predicates(r)
     return r.report()
 
 
