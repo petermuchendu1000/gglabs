@@ -331,6 +331,59 @@ def check_permission_predicates(r: Results) -> None:
     check_the_guard_fires(r, deploy_check)
     check_java_version_parsing(r, deploy_check)
     check_toolchain_guard_fires(r, deploy_check)
+    check_android_installer(r)
+
+
+def check_android_installer(r: Results) -> None:
+    """install_android_sdk.sh appends to .env, which is the risky thing it does.
+
+    A duplicate key is not cosmetic here: pipeline._load_env walks the file
+    top-down with os.environ.setdefault, so the FIRST occurrence wins, while
+    python-dotenv's load_dotenv lets the LAST one win. A second ANDROID_HOME
+    therefore makes the console and the service disagree about its value, and
+    nothing announces it. The .sh writers contract above does not cover this
+    script - it never spells ENV_FILE - so the guard is checked here.
+    """
+    print("\n-- deploy/install_android_sdk.sh --")
+    path = DEPLOY / "install_android_sdk.sh"
+    r.check("the installer is checked in", path.exists(),
+            "the fix has to be pasted by hand again, into a console that "
+            "mangles long pastes - which is how it failed the first time")
+    if not path.exists():
+        return
+    text = path.read_text(encoding="utf-8")
+
+    r.check("it is syntactically valid bash",
+            subprocess.run(["bash", "-n", str(path)],
+                           capture_output=True).returncode == 0,
+            "it would die part-way through, as root, on the server")
+
+    appends = "ANDROID_HOME=%s\\n' \"$SDK_ROOT\" >> \"${APP_DIR}/.env\"" in text
+    r.check("it appends ANDROID_HOME to .env", appends,
+            "the console path would not see the SDK")
+    r.check("...only after checking the key is absent",
+            "grep -q '^ANDROID_HOME=' \"${APP_DIR}/.env\"" in text,
+            "an unguarded append creates a duplicate, and the two loaders "
+            "disagree about which copy wins")
+    r.check("it never rewrites .env in place",
+            "sed -i" not in text,
+            "an in-place edit of .env can truncate it; every other deploy "
+            "script writes a new file and moves it")
+    r.check("it reads compileSdk from the template rather than hardcoding it",
+            "compileSdk" in text and "android-35" not in text,
+            "a hardcoded platform goes stale the moment the template is "
+            "bumped, and the build then fails for a platform nobody checked")
+    r.check("it verifies the download is a zip before unpacking",
+            "unzip -tq" in text or "file \"$TMP_ZIP\"" in text,
+            "a proxy error page arrives with a 200 and would read as a "
+            "successful download")
+    r.check("it makes the SDK readable by the service user",
+            "chmod -R a+rX" in text,
+            "root installs it, a non-root service reads it - the same fault "
+            "that made delegate.py unreadable")
+    r.check("it refuses to run as non-root",
+            'id -u' in text,
+            "it would fail half way with a confusing permission error")
 
 
 def check_java_version_parsing(r: Results, deploy_check) -> None:
