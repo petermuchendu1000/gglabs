@@ -64,13 +64,16 @@ CREDENTIALS
     CLOUDFLARE_API_TOKEN   required for every live call
     CLOUDFLARE_ACCOUNT_ID  required to create a zone; optional elsewhere
 
-    DO NOT use GET /user/tokens/verify to check a token. Measured 2026-11-20
-    against a working `cfat_`-prefixed scoped token: verify answers
-    1000 "Invalid API Token" while that same token succeeds on every call
-    this module makes - zones, dns_records (read AND write), email routing,
-    destination addresses and the GraphQL analytics. A failing verify proves
-    nothing about a token; it has already sent two debugging attempts down a
-    false trail here. Test a token with the call you actually need.
+    A CLOUDFLARE CREDENTIAL CAN ONLY BE TESTED FROM WHERE IT WILL RUN.
+    The build/agent environment routes api.cloudflare.com through a proxy
+    that REPLACES the Authorization header with its own credential, so every
+    call from there succeeds no matter what token is supplied - including a
+    revoked one. A scope check run there measures the proxy, not the token,
+    and reads as a clean pass. That produced a confident and entirely wrong
+    "the token is good" during this module's rollout; the server, which has
+    no such proxy, answered 9109 "Invalid access token" to the same value.
+    Check a credential on the host that will use it, with the call you
+    actually need - delegate.delegation_state() is the cheapest one here.
 Both are read at CALL time, not at import, so a .env loaded later still
 works and so tests can set them. A scoped token is enough: zone creation
 needs Zone:Edit or DNS:Edit, the activation check needs Zone:Write, records
