@@ -435,6 +435,55 @@ def check_unrouted_company_does_not_get_a_support_email(r: Results) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_a_broken_dev_route_does_not_mark_the_stage_complete(r: Results) -> None:
+    """The dashboard's stage tick, and the run-all skip, must not read
+    "an address was assigned" as "mail reaches this company".
+
+    _compute_stages decides two things at once: which tick the operator sees,
+    and which stages a run-all SKIPS. Keyed on Assigned Email alone, a company
+    whose dev@ route failed is skipped for ever: the email stage returns an
+    error the first time and halts the chain, but on the next run-all the
+    stage reads done, so the chain walks straight past the one thing that is
+    broken and on to director_id and app - which ship dev@<domain> as the
+    support address Play review writes to.
+
+    Same family as the surviving mutant above, one layer up: there the stage
+    body could advertise an unrouted address, here the stage is never re-run
+    to fix it.
+    """
+    print("\n-- an assigned address is not a working route --")
+    import api_v2
+
+    def stages(**row):
+        base = {"Company Name": "ACME LTD", "Domain": "acme.uk"}
+        base.update(row)
+        return api_v2._compute_stages("00000001", base)
+
+    s = stages(**{"Assigned Email": "owner@real.example",
+                  "Dev Email Forwarding": "configured"})
+    # The control, first: without this the checks below are vacuous, because
+    # a _compute_stages that returned False for every email row would pass
+    # all of them.
+    r.check("a configured route DOES mark the stage complete",
+            s.get("email") is True,
+            "if this fails every check below is vacuous: " + repr(s))
+
+    for status in ("pending_verification", "not_delegated", "routing_not_ready",
+                   "error", ""):
+        s = stages(**{"Assigned Email": "owner@real.example",
+                      "Dev Email Forwarding": status})
+        r.check(f"{status!r} does NOT mark the stage complete",
+                s.get("email") is False,
+                "run-all would skip the email stage and ship an unrouted "
+                "dev@ address as the Play review contact: " + repr(s))
+
+    # And the older half of the condition still holds: no address, not done,
+    # whatever the routing column happens to say.
+    s = stages(**{"Assigned Email": "", "Dev Email Forwarding": "configured"})
+    r.check("no assigned address is not complete either",
+            s.get("email") is False, repr(s))
+
+
 def check_print_summary(r: Results) -> None:
     print("\n-- print_summary reads what the build wrote --")
     tmp = tempfile.mkdtemp()
@@ -567,6 +616,7 @@ def main() -> int:
     check_dev_address(r)
     check_manifest(r)
     check_unrouted_company_does_not_get_a_support_email(r)
+    check_a_broken_dev_route_does_not_mark_the_stage_complete(r)
     check_print_summary(r)
     check_co_dir_matches_writer(r)
     check_no_db_write(r)

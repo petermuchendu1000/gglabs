@@ -22,6 +22,7 @@ HERMETIC_TESTS := \
 	test_delegation.py \
 	test_delegate_stage.py \
 	test_deploy_scripts.py \
+	test_e2e_run.py \
 	test_email_stage.py \
 	test_flavor_regen.py \
 	test_generate_portability.py \

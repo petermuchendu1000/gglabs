@@ -342,7 +342,17 @@ def _compute_stages(cn: str, row: dict) -> dict:
         # arrive - marking the stage done there is the silent-success bug.
         "delegate":    str(row.get("DNS Delegation") or "").strip().lower()
                        == "active",
-        "email":       bool(row.get("Assigned Email")),
+        # BOTH halves, because this dict decides the operator's tick AND
+        # which stages a run-all skips. An address assigned out of the pool
+        # is not a route: ensure_dev_route can land on pending_verification,
+        # not_delegated, routing_not_ready or error, and the stage returns a
+        # failure for each. Keyed on the address alone, that failure halted
+        # the chain once and was then skipped for ever - so the next run-all
+        # walked past the broken route into director_id and app, which ship
+        # dev@<domain> as the support address Play review writes to.
+        "email":       bool(row.get("Assigned Email")) and
+                       str(row.get("Dev Email Forwarding") or "").strip().lower()
+                       == "configured",
         "director_id": (cdir / "director_id" / "ID Front.jpeg").exists(),
         "app":         has_app,
     }
