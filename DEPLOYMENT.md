@@ -351,11 +351,27 @@ CLOUDFLARE_API_TOKEN=    # scoped token, NOT a Global API Key. Needs:
                          #   Account> Account Analytics > Read (delivery log)
 CLOUDFLARE_ACCOUNT_ID=   # required to create a zone and to manage
                          # account-level destination addresses
-CLOUDFLARE_EMAIL_WORKER= # optional. Unset: dev@ forwards to the company's
-                         # assigned mailbox, which Cloudflare will not
-                         # deliver to until a human verifies it once. Set to
-                         # a deployed Email Worker's script name: no
-                         # verification step at all.
+CLOUDFLARE_EMAIL_WORKER=pipeline-email
+                         # NOT optional in practice. Unset, dev@ forwards to
+                         # the company's assigned mailbox, and Cloudflare will
+                         # not deliver to an address no human has verified by
+                         # clicking a link in it. The pool holds one Gmail per
+                         # company, so unset means one manual verification per
+                         # company and an email stage that returns
+                         # pending_verification and halts the chain every
+                         # time. Measured on 2026-11-20: the account had
+                         # exactly ONE verified destination and no email
+                         # Worker, so every new company would have stopped
+                         # here.
+                         #
+                         # pipeline-email is deployed from
+                         # workers/pipeline_email.js. A worker-action routing
+                         # rule needs no recipient verification at all; the
+                         # worker then forwards to the single already-verified
+                         # address, which is a constant rather than a
+                         # per-company step. Its FORWARD_TO binding carries
+                         # that address and is set at deploy time, so no
+                         # mailbox is written into the repository.
 
 IBENTY_EMAIL=            # the ibenty.com account. The service used to be
 IBENTY_PASSWORD=         # xbinder.net; XBINDER_EMAIL / XBINDER_PASSWORD are
