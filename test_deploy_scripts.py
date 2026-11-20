@@ -27,6 +27,7 @@ has already had twice, in the scorer and in the output path.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import sys
@@ -384,6 +385,68 @@ def check_android_installer(r: Results) -> None:
     r.check("it refuses to run as non-root",
             'id -u' in text,
             "it would fail half way with a confusing permission error")
+    check_protecthome_caches(r, text)
+
+
+def check_protecthome_caches(r: Results, installer: str) -> None:
+    """ProtectHome=true means every tool that caches under $HOME needs a path.
+
+    The unit sets ProtectHome=true, so /home, /root and /run/user are EMPTY
+    for the service. Any tool that defaults its cache to $HOME/... therefore
+    cannot create it. Playwright hit this and was fixed with
+    PLAYWRIGHT_BROWSERS_PATH; Gradle hit it next and cost a whole pipeline
+    run, exiting 1 in under 50ms with nothing printed - which reached the job
+    drawer as "Gradle exit=1 in 0.0s" and read as a build failure when
+    nothing had been built.
+
+    What makes it expensive to diagnose is that running the same command by
+    hand as root WORKS: root's home is masked only for the service. So the
+    rule is checked here rather than discovered again.
+    """
+    print("\n-- ProtectHome=true and the caches it breaks --")
+    unit = (DEPLOY / "company-registration.service").read_text(encoding="utf-8")
+
+    protects = "ProtectHome=true" in unit
+    r.check("the unit still sets ProtectHome=true", protects,
+            "if this was turned off the rule below no longer applies - but "
+            "check that deliberately rather than by deleting this test")
+    if not protects:
+        return
+
+    for var, tool in (("PLAYWRIGHT_BROWSERS_PATH", "Playwright's browsers"),
+                      ("GRADLE_USER_HOME", "the Gradle distribution"),
+                      ("ANDROID_HOME", "the Android SDK")):
+        m = re.search(rf"^Environment={re.escape(var)}=(.+)$", unit,
+                      re.MULTILINE)
+        if not r.check(f"{var} is set in the unit", bool(m),
+                       f"{tool} would be written under a masked $HOME and "
+                       f"the tool would fail with no usable message"):
+            continue
+        value = m.group(1).strip()
+        r.check(f"...and {var} points outside $HOME",
+                not value.startswith(("/home", "/root", "~")),
+                f"{value!r} is inside the directory ProtectHome empties")
+
+    # The installer writes a drop-in for servers whose unit predates those
+    # lines. The two must agree, or a box ends up with one value from the
+    # unit and another from the drop-in and nothing says which won.
+    for var in ("ANDROID_HOME", "GRADLE_USER_HOME"):
+        in_unit = re.search(rf"^Environment={var}=(.+)$", unit, re.MULTILINE)
+        r.check(f"the installer also sets {var}",
+                f"Environment={var}=" in installer,
+                "a server installed before the unit changed would not get it")
+        if in_unit:
+            value = in_unit.group(1).strip()
+            r.check(f"...and the installer uses the same path for {var}",
+                    value in installer,
+                    f"the unit says {value!r} and the installer does not "
+                    f"mention it, so the two disagree")
+
+    r.check("the installer proves gradlew works AS THE SERVICE USER",
+            "sudo -u" in installer and "gradlew" in installer,
+            "running the wrapper as root proves nothing: root's home is "
+            "masked only for the service, so it succeeds from a console and "
+            "fails under systemd - which is exactly what happened")
 
 
 def check_java_version_parsing(r: Results, deploy_check) -> None:

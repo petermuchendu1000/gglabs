@@ -26,6 +26,28 @@ Environment=DISPLAY=:99
 Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 Environment=PYTHONUNBUFFERED=1
 
+# The same problem as PLAYWRIGHT_BROWSERS_PATH above, for the app stage, and
+# it cost a whole pipeline run to find.
+#
+# ProtectHome=true below makes /home, /root and /run/user empty for this
+# service. The Gradle wrapper puts its downloaded distribution and caches in
+# GRADLE_USER_HOME, which defaults to $HOME/.gradle - a path that does not
+# exist here and cannot be created. So gradlew exited 1 in under 50ms having
+# printed nothing, which arrived in the job drawer as "Gradle exit=1 in 0.0s"
+# and looked like a build failure. Nothing was built; it never started.
+#
+# Running the wrapper by hand as root works and proves nothing: root's home
+# is only masked for THIS service, so the same command succeeds from a
+# console and fails under systemd.
+#
+# /opt is writable here - ProtectSystem=full covers /usr, /boot and /etc, not
+# /opt - and the directory must be owned by the pipeline user.
+Environment=GRADLE_USER_HOME=/opt/gradle-home
+
+# Where the app stage finds the Android SDK. generate.py resolves ANDROID_HOME
+# at import and falls back to ~/Android/Sdk, which ProtectHome also masks.
+Environment=ANDROID_HOME=/opt/android-sdk
+
 ExecStart=/opt/company_registration/.venv/bin/gunicorn -c gunicorn.conf.py app:app
 
 Restart=always

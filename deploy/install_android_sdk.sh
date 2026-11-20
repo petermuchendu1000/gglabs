@@ -23,6 +23,7 @@
 set -uo pipefail
 
 SDK_ROOT="${ANDROID_SDK_INSTALL_DIR:-/opt/android-sdk}"
+GRADLE_HOME="${GRADLE_USER_HOME_DIR:-/opt/gradle-home}"
 APP_DIR="${APP_DIR:-/opt/company_registration}"
 CMDLINE_ZIP="commandlinetools-linux-13114758_latest.zip"
 CMDLINE_URL="https://dl.google.com/android/repository/${CMDLINE_ZIP}"
@@ -113,15 +114,53 @@ GRADLEW="${APP_DIR}/apps/template-shift-journal/gradlew"
 [ -f "$GRADLEW" ] && chmod a+rx "$GRADLEW" && ok "gradlew is a+rx"
 ok "${SDK_ROOT} is readable and traversable by all"
 
-say "5. ANDROID_HOME for the service"
+say "5. a Gradle home the service can actually write to"
+# THE FAULT THAT COST A WHOLE PIPELINE RUN. The unit sets ProtectHome=true,
+# so /home, /root and /run/user are empty for the service. gradlew puts its
+# downloaded distribution in GRADLE_USER_HOME, defaulting to $HOME/.gradle -
+# a path that does not exist and cannot be created - so it exited 1 in under
+# 50ms having printed nothing. Running the wrapper by hand as root works and
+# proves NOTHING: root's home is masked only for the service.
+SERVICE_USER=$(systemctl show -p User --value company-registration 2>/dev/null)
+[ -n "$SERVICE_USER" ] || SERVICE_USER=pipeline
+ok "the service runs as ${SERVICE_USER}"
+mkdir -p "$GRADLE_HOME" || die "could not create ${GRADLE_HOME}"
+chown -R "${SERVICE_USER}:${SERVICE_USER}" "$GRADLE_HOME" \
+  || die "could not give ${SERVICE_USER} ownership of ${GRADLE_HOME}"
+ok "${GRADLE_HOME} is owned by ${SERVICE_USER}"
+
+say "6. environment for the service"
 # In the unit, not only .env: generate.py resolves ANDROID_HOME at import and
-# .env is not reliably loaded before that happens.
+# .env is not reliably loaded before that happens. deploy/company-registration
+# .service carries both of these too and is the canonical definition; this
+# drop-in catches up a unit that was installed before they were added.
 mkdir -p "$(dirname "$UNIT_DROPIN")"
-printf '[Service]\nEnvironment=ANDROID_HOME=%s\n' "$SDK_ROOT" > "$UNIT_DROPIN" \
+printf '[Service]\nEnvironment=ANDROID_HOME=%s\nEnvironment=GRADLE_USER_HOME=%s\n' \
+  "$SDK_ROOT" "$GRADLE_HOME" > "$UNIT_DROPIN" \
   || die "could not write ${UNIT_DROPIN}"
 ok "wrote ${UNIT_DROPIN}"
 systemctl daemon-reload && ok "systemd reloaded"
 
+say "7. warm the wrapper AS THE SERVICE USER"
+# The only check that means anything: the same user, the same GRADLE_USER_HOME.
+# It also pulls the 100M distribution now rather than inside a pipeline stage.
+TEMPLATE="${APP_DIR}/apps/template-shift-journal"
+if [ -x "${TEMPLATE}/gradlew" ]; then
+  if sudo -u "$SERVICE_USER" env "GRADLE_USER_HOME=${GRADLE_HOME}" \
+       "JAVA_HOME=${JAVA_HOME:-}" sh -c \
+       "cd '${TEMPLATE}' && ./gradlew --no-daemon --version" >/tmp/gradlew_warm.log 2>&1
+  then
+    ok "gradlew runs as ${SERVICE_USER}: $(grep -m1 '^Gradle ' /tmp/gradlew_warm.log)"
+  else
+    bad "gradlew STILL fails as ${SERVICE_USER}; last lines:"
+    tail -15 /tmp/gradlew_warm.log | sed 's/^/        /'
+    die "fix this before running the app stage: the dashboard will hit it too"
+  fi
+else
+  bad "${TEMPLATE}/gradlew is missing or not executable; skipped the warm-up"
+fi
+
+say "8. .env, for the console path"
 if grep -q '^ANDROID_HOME=' "${APP_DIR}/.env" 2>/dev/null; then
   ok ".env already has ANDROID_HOME; left alone (a duplicate would make "
   ok "  the console and the service disagree about its value)"
