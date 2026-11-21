@@ -22,6 +22,7 @@ the standalone tools work that way. None of the three in-repo callers does.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -419,6 +420,119 @@ def check_broken_java_home_is_dropped(r: Results) -> None:
             repr(out))
 
 
+def check_no_developer_machine_paths(r: Results) -> None:
+    """A Windows path compiled into a module that runs on a Linux server.
+
+    stage_build held two, and they were not inert defaults - they were the
+    cause of two separate failures:
+
+      java_home = os.environ.get("JAVA_HOME", r"C:\\Program Files\\...\\jbr")
+      os.environ["JAVA_HOME"] = java_home
+
+    That SETS JAVA_HOME, unconditionally, every time the stage runs. Deleting
+    the line from .env could never have helped, because .env was never where
+    it came from - and I spent two cycles telling the operator to look there.
+
+      sdk = os.environ.get("ANDROID_HOME", r"C:\\Users\\LENOVO\\...\\Sdk")
+
+    With ANDROID_HOME unset that is written into local.properties as sdk.dir,
+    and the Android Gradle Plugin then dies inside getTargetBootClasspath
+    trying to load a platform from a path that cannot exist here.
+
+    A default that can only be correct on one person's laptop is not a
+    default. It converts "this is not configured" - which an operator can
+    see and fix - into "this is configured wrongly", which looks like a bug
+    in the build.
+    """
+    print("\n-- no developer-machine paths compiled into the source --")
+    pattern = re.compile(r"""r?["'][A-Za-z]:\\""")
+    offenders = []
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(REPO):
+        dirnames[:] = [d for d in dirnames
+                       if d not in {".git", ".venv", "__pycache__", "e2e",
+                                    "pipeline_output", "node_modules"}]
+        for fn in filenames:
+            if not fn.endswith(".py") or fn.startswith("test_"):
+                continue
+            path = os.path.join(dirpath, fn)
+            scanned += 1
+            for i, line in enumerate(
+                    open(path, encoding="utf-8").read().splitlines(), 1):
+                # Comment lines are skipped: a comment recording a path that
+                # was REMOVED is the useful kind of mention, and banning it
+                # would push the explanation out of the file that needs it.
+                # The regex requires a quote immediately before the drive
+                # letter, so prose in a docstring does not match either.
+                # LIMIT: a Windows path inside a trailing inline comment on a
+                # line of code would be missed. Nothing has ever had one.
+                if line.lstrip().startswith("#"):
+                    continue
+                if pattern.search(line):
+                    offenders.append(
+                        f"{os.path.relpath(path, REPO)}:{i}: {line.strip()}")
+
+    # The control: the walk must actually find modules, or this is vacuous.
+    r.check(f"{scanned} modules scanned", scanned > 20,
+            "the walk found almost nothing, so finding no offenders means "
+            "nothing")
+    r.check("no module carries a Windows absolute path", not offenders,
+            "a default that can only be right on one laptop silently "
+            "overrides correct server configuration:\n        "
+            + "\n        ".join(offenders))
+
+
+def check_stage_build_requires_android_home(r: Results) -> None:
+    """Unset ANDROID_HOME must stop the stage, not fall back to a guess."""
+    print("\n-- stage_build refuses to guess the SDK location --")
+    import io
+    from contextlib import redirect_stdout
+
+    import pipeline
+
+    def run(env):
+        saved = {k: os.environ.get(k) for k in ("ANDROID_HOME", "JAVA_HOME")}
+        for k in saved:
+            os.environ.pop(k, None)
+        os.environ.update({k: v for k, v in env.items() if v is not None})
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                pipeline.stage_build(company_numbers=["00000001"])
+            return buf.getvalue()
+        finally:
+            for k in saved:
+                os.environ.pop(k, None)
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    out = run({})
+    r.check("it stops when ANDROID_HOME is unset",
+            "ANDROID_HOME" in out, repr(out[-400:]))
+    r.check("...and never reaches the database",
+            "Building" not in out,
+            "it carried on with a guessed SDK path: " + repr(out[-400:]))
+
+    # JAVA_HOME must be left exactly as found - not set, not overwritten.
+    saved_jh = os.environ.get("JAVA_HOME")
+    try:
+        os.environ.pop("JAVA_HOME", None)
+        run({})
+        r.check("an unset JAVA_HOME is still unset afterwards",
+                "JAVA_HOME" not in os.environ,
+                f"the stage injected JAVA_HOME={os.environ.get('JAVA_HOME')!r}")
+        os.environ["JAVA_HOME"] = "/sentinel/jdk"
+        run({"JAVA_HOME": "/sentinel/jdk"})
+        r.check("an existing JAVA_HOME is left untouched",
+                os.environ.get("JAVA_HOME") == "/sentinel/jdk",
+                f"it became {os.environ.get('JAVA_HOME')!r}")
+    finally:
+        os.environ.pop("JAVA_HOME", None)
+        if saved_jh is not None:
+            os.environ["JAVA_HOME"] = saved_jh
+
+
 def main() -> int:
     r = Results()
     print(f"target: apps/generator/catalog.load_companies (stage 5's source)")
@@ -429,6 +543,8 @@ def main() -> int:
     check_callers(r)
     check_gradle_output_is_relayed(r)
     check_broken_java_home_is_dropped(r)
+    check_no_developer_machine_paths(r)
+    check_stage_build_requires_android_home(r)
     return r.report()
 
 

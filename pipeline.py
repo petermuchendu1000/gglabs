@@ -697,12 +697,37 @@ def stage_build(
 ) -> None:
     _banner("STAGE 5 — App build")
 
-    sdk = os.environ.get(
-        "ANDROID_HOME",
-        r"C:\Users\LENOVO\AppData\Local\Android\Sdk",
-    )
-    java_home = os.environ.get("JAVA_HOME", r"C:\Program Files\Android\Android Studio\jbr")
-    os.environ["JAVA_HOME"] = java_home
+    # NO DEFAULT. This used to fall back to one developer's laptop paths:
+    #
+    #   sdk       = ... or r"C:\Users\LENOVO\AppData\Local\Android\Sdk"
+    #   java_home = ... or r"C:\Program Files\Android\Android Studio\jbr"
+    #   os.environ["JAVA_HOME"] = java_home
+    #
+    # Both caused real failures on the server. The sdk default is written
+    # into local.properties as sdk.dir, and the Android Gradle Plugin then
+    # dies inside getTargetBootClasspath loading a platform from a path that
+    # cannot exist on Linux. The java_home line was worse: it SET JAVA_HOME,
+    # unconditionally, on every run - so the Windows value appeared in the
+    # environment no matter what .env said, and deleting it from .env could
+    # never have helped. Two diagnosis cycles went into looking in .env for
+    # a value this line was injecting.
+    #
+    # A default that can only be correct on one machine is not a default. It
+    # turns "not configured", which an operator can see and fix, into
+    # "configured wrongly", which reads as a bug in the build. Unset now
+    # stops the stage and says so.
+    #
+    # JAVA_HOME is deliberately NOT touched at all. gradlew uses the java on
+    # PATH when it is unset, which is correct here, and generate.run_gradle
+    # drops a JAVA_HOME that has no bin/java behind it.
+    sdk = os.environ.get("ANDROID_HOME", "").strip()
+    if not sdk:
+        print("  ANDROID_HOME is not set, so the Android SDK cannot be "
+              "located and local.properties would be written with a "
+              "placeholder.")
+        print("  Set it in the service unit and in .env, e.g. "
+              "ANDROID_HOME=/opt/android-sdk, then re-run.")
+        return
 
     sys.path.insert(0, str(BASE_DIR))
     from apps.generator.catalog import load_companies

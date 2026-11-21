@@ -38,14 +38,18 @@ def _find_keytool() -> str:
         return exe
     java_home = os.environ.get("JAVA_HOME", "")
     if java_home:
-        cand = os.path.join(java_home, "bin", "keytool.exe")
-        if os.path.exists(cand):
-            return cand
-    # Fallback to Eclipse Adoptium (detected on this machine).
-    fallback = r"C:\Program Files\Eclipse Adoptium\jdk-25.0.1.8-hotspot\bin\keytool.exe"
-    if os.path.exists(fallback):
-        return fallback
-    raise FileNotFoundError("keytool not found — install a JDK or set JAVA_HOME")
+        for exe in ("keytool", "keytool.exe"):
+            cand = os.path.join(java_home, "bin", exe)
+            if os.path.exists(cand):
+                return cand
+    # There was a third branch here hardcoding one machine's Adoptium
+    # install. It was guarded by os.path.exists so it never fired on the
+    # server, but it is the same defect as the two Windows defaults removed
+    # from pipeline.stage_build and it belongs with them. PATH and JAVA_HOME
+    # are the two places a JDK is findable; a third is somebody's laptop.
+    raise FileNotFoundError(
+        "keytool not found. Install a JDK (the app template needs 17) or "
+        "set JAVA_HOME to one that has bin/keytool.")
 
 
 @dataclass(frozen=True)
