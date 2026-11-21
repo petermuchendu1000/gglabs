@@ -82,6 +82,28 @@ def check_money_gate(r: Results) -> None:
         r.check(f"{s} complete is ALREADY",
                 e2e_run.plan_stage(s, True, False) == e2e_run.ALREADY, s)
 
+    # --force re-runs a completed stage. Needed because new code inside an
+    # already-complete stage can never otherwise run: the app stage finished
+    # before the privacy publisher existed, so that company has no policy
+    # URL and no way to acquire one from the console.
+    r.check("force re-runs a completed free stage",
+            e2e_run.plan_stage("email", True, False, force=True)
+            == e2e_run.RUN,
+            "a finished stage could never be re-run to exercise new code")
+    # But forcing the MONEY stage still needs --spend. Forcing a re-run of
+    # `domain` means buying a second domain, and --force is not consent to
+    # spend; the two flags authorise different things.
+    r.check("forcing the money stage still needs --spend",
+            e2e_run.plan_stage("domain", True, False, force=True)
+            == e2e_run.BLOCKED,
+            "--force would have bought a second domain on its own")
+    r.check("...and with both flags it runs",
+            e2e_run.plan_stage("domain", True, True, force=True)
+            == e2e_run.RUN, "the two together are explicit enough")
+    r.check("force changes nothing for a stage that is not done",
+            e2e_run.plan_stage("email", False, False, force=True)
+            == e2e_run.RUN, "it was going to run anyway")
+
 
 # ── The verdict ────────────────────────────────────────────────────────────
 
@@ -369,6 +391,38 @@ def check_running_as_root_is_refused(r: Results) -> None:
             "harness at all")
 
 
+def check_force_reruns_a_finished_stage(r: Results) -> None:
+    """Through drive(), not just the predicate.
+
+    The app stage finished before the privacy publisher existed, so that
+    company carries no policy URL. Without --force there is no way to make a
+    completed stage run again from the console, and new code inside it can
+    never execute.
+    """
+    print("\n-- --force re-runs a stage that is already complete --")
+    f = Fake(done=api_v2.STAGE_ORDER)
+    code, out = drive(f, allow_spend=True, only=["app"], force=["app"])
+    r.check("the finished stage ran", f.ran == ["app"],
+            f"nothing re-ran: {f.ran!r}")
+    r.check("the plan says it was forced", "FORCED" in out,
+            "an operator reading the log cannot tell it was overridden: "
+            + out[:400])
+    r.check("...and the run counts as a proof", code == 0, out[-300:])
+
+    # The control: the same company WITHOUT --force must still skip.
+    f2 = Fake(done=api_v2.STAGE_ORDER)
+    code2, out2 = drive(f2, allow_spend=True, only=["app"])
+    r.check("without --force it is still skipped", f2.ran == [], repr(f2.ran))
+    r.check("...and still proves nothing", code2 != 0 and "proves nothing" in out2,
+            f"{code2} {out2[-300:]}")
+
+    # Forcing one stage must not force the others.
+    f3 = Fake(done=api_v2.STAGE_ORDER)
+    drive(f3, allow_spend=True, force=["email"])
+    r.check("forcing one stage leaves the rest skipped", f3.ran == ["email"],
+            f"--force leaked to other stages: {f3.ran!r}")
+
+
 def check_main_actually_runs(r: Results) -> None:
     """Exercise main(), not just the predicate it calls.
 
@@ -442,6 +496,7 @@ def main() -> int:
     check_a_failure_that_reads_complete_still_halts(r)
     check_only_subset(r)
     check_running_as_root_is_refused(r)
+    check_force_reruns_a_finished_stage(r)
     check_main_actually_runs(r)
     check_it_is_not_a_second_pipeline(r)
     return r.report()

@@ -99,9 +99,20 @@ def root_guard(euid: int, service_user: str, allow_root: bool) -> str | None:
     )
 
 
-def plan_stage(stage: str, is_done: bool, allow_spend: bool) -> str:
-    """What should happen to one stage: RUN, ALREADY or BLOCKED."""
-    if is_done:
+def plan_stage(stage: str, is_done: bool, allow_spend: bool,
+               force: bool = False) -> str:
+    """What should happen to one stage: RUN, ALREADY or BLOCKED.
+
+    `force` re-runs a stage that is already complete. Without it, new code
+    inside a finished stage can never run: the app stage completed before
+    the privacy publisher existed, so that company has no policy URL and no
+    way to acquire one short of deleting its artifacts by hand.
+
+    --force is NOT consent to spend. Forcing `domain` means buying a second
+    domain, so it still requires --spend; the two flags authorise different
+    things and both are needed to re-purchase.
+    """
+    if is_done and not force:
         return ALREADY
     if stage in MONEY_STAGES and not allow_spend:
         return BLOCKED
@@ -171,10 +182,12 @@ def pick_company(api_v2, db, nationality: str = "kenyan") -> tuple[str, str]:
 
 # ── The driver ─────────────────────────────────────────────────────────────
 
-def drive(cn: str, allow_spend: bool, only=None, stop_after=None) -> int:
+def drive(cn: str, allow_spend: bool, only=None, stop_after=None,
+          force=None) -> int:
     import api_v2
     import db
 
+    force = set(force or ())
     order = [s for s in api_v2.STAGE_ORDER if not only or s in only]
     row = api_v2._find_row(cn)
     if not row:
@@ -193,8 +206,10 @@ def drive(cn: str, allow_spend: bool, only=None, stop_after=None) -> int:
     print("\nplan:")
     planned = {}
     for s in order:
-        planned[s] = plan_stage(s, bool(before.get(s)), allow_spend)
-        note = {RUN: "will run",
+        planned[s] = plan_stage(s, bool(before.get(s)), allow_spend,
+                                force=s in force)
+        note = {RUN: ("will run (FORCED, it is already complete)"
+                      if s in force and before.get(s) else "will run"),
                 ALREADY: "already complete - will be SKIPPED, proves nothing",
                 BLOCKED: "SPENDS MONEY - blocked without --spend"}[planned[s]]
         print(f"  {s:<12} {note}")
@@ -311,6 +326,11 @@ def main() -> int:
                    help="director nationality to search for with --find")
     p.add_argument("--only", default="",
                    help="comma-separated subset of stages to consider")
+    p.add_argument("--force", default="",
+                   help="comma-separated stages to re-run even though they "
+                        "are already complete, or 'all'. Forcing the domain "
+                        "stage still requires --spend: it would buy a second "
+                        "domain.")
     p.add_argument("--allow-root", action="store_true",
                    help="run as root anyway, leaving files the service user "
                         "cannot delete")
@@ -337,7 +357,10 @@ def main() -> int:
     import db
 
     only = [s.strip() for s in a.only.split(",") if s.strip()]
-    for s in only:
+    force = [s.strip() for s in a.force.split(",") if s.strip()]
+    if force == ["all"]:
+        force = list(api_v2.STAGE_ORDER)
+    for s in only + force:
         if s not in api_v2.STAGE_ORDER:
             print(f"!! unknown stage {s!r}; known: {', '.join(api_v2.STAGE_ORDER)}")
             return 2
@@ -351,7 +374,7 @@ def main() -> int:
     else:
         cn = api_v2._cn8(a.company)
 
-    return drive(cn, allow_spend=a.spend, only=only)
+    return drive(cn, allow_spend=a.spend, only=only, force=force)
 
 
 if __name__ == "__main__":
