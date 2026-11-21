@@ -565,6 +565,22 @@ def check_java_version_parsing(r: Results, deploy_check) -> None:
                 "unparseable output must not become a number, which would be "
                 "compared against the floor and silently pass or fail")
 
+    # A java on PATH proves nothing: Gradle prefers JAVA_HOME. Observed on
+    # the server, a .env carrying a developer's Windows JAVA_HOME killed
+    # every build with "JAVA_HOME is set to an invalid directory" while
+    # java -version answered perfectly and section 9 passed.
+    for value, expect, why in (
+        (r"C:\Program Files\Android\Android Studio\jbr", True,
+         "the exact value that reached the server"),
+        ("C:/Users/dev/jdk", True, "a drive letter with forward slashes"),
+        (r"D:\jdk17", True, "any drive letter"),
+        ("/usr/lib/jvm/java-17-openjdk-amd64", False, "the correct value"),
+        ("/opt/jdk", False, "any POSIX path"),
+        ("", False, "unset is correct - gradlew then uses PATH"),
+    ):
+        r.check(f"looks_like_windows_path({value!r}) is {expect}",
+                deploy_check.looks_like_windows_path(value) is expect, why)
+
     # The floor comes from the template, not from this test.
     sdk = deploy_check.required_compile_sdk()
     r.check("compileSdk is read from the app template", sdk == 35,
@@ -583,7 +599,7 @@ def check_toolchain_guard_fires(r: Results, deploy_check) -> None:
     def run(env):
         saved_results = deploy_check.RESULTS
         saved_env = {k: os.environ.get(k) for k in
-                     ("ANDROID_HOME", "ANDROID_SDK_ROOT")}
+                     ("ANDROID_HOME", "ANDROID_SDK_ROOT", "JAVA_HOME")}
         deploy_check.RESULTS = []
         for k in saved_env:
             os.environ.pop(k, None)
@@ -600,6 +616,29 @@ def check_toolchain_guard_fires(r: Results, deploy_check) -> None:
             for k, v in saved_env.items():
                 if v is not None:
                     os.environ[k] = v
+
+    # A Windows JAVA_HOME must FAIL even though java is on PATH and the SDK
+    # is fine. This is the whole point: the passing check was the wrong one.
+    tmp_sdk = Path(tempfile.mkdtemp())
+    (tmp_sdk / "platforms" / f"android-{deploy_check.required_compile_sdk()}"
+     ).mkdir(parents=True)
+    (tmp_sdk / "build-tools" / "35.0.0").mkdir(parents=True)
+    try:
+        fails = run({"ANDROID_HOME": str(tmp_sdk),
+                     "JAVA_HOME": r"C:\Program Files\Android\Android Studio\jbr"})
+        r.check("a Windows JAVA_HOME is reported FAILED",
+                any("JAVA_HOME" in f for f in fails),
+                f"the build dies and nothing warned: {fails!r}")
+        r.check("...and the reason says it is a Windows path",
+                any("Windows path" in f for f in fails), repr(fails))
+        # The control: the same SDK with JAVA_HOME unset must be clean.
+        fails = run({"ANDROID_HOME": str(tmp_sdk)})
+        r.check("...and an unset JAVA_HOME is not a failure",
+                not any("JAVA_HOME" in f for f in fails),
+                "gradlew uses the java on PATH when JAVA_HOME is unset, "
+                "which is the normal server arrangement: " + repr(fails))
+    finally:
+        shutil.rmtree(tmp_sdk, ignore_errors=True)
 
     # No ANDROID_HOME at all - the state of a fresh server.
     fails = run({})

@@ -400,6 +400,19 @@ def java_major(version_output: str) -> int | None:
         return None
 
 
+def looks_like_windows_path(value: str) -> bool:
+    """A drive letter or a backslash separator: somebody's .env travelled.
+
+    Worth its own predicate because the resulting failure names the variable
+    but not the reason, and "invalid directory" invites somebody to create
+    the directory rather than to delete the line.
+    """
+    v = (value or "").strip()
+    if not v:
+        return False
+    return bool(re.match(r"^[A-Za-z]:[\\/]", v)) or "\\" in v
+
+
 def required_compile_sdk() -> int | None:
     """compileSdk from the app template, so this check cannot go stale.
 
@@ -439,6 +452,33 @@ def check_build_toolchain() -> None:
     keytool = shutil.which("keytool")
     record("keytool is on PATH", "PASS" if keytool else "FAIL",
            keytool or "keystore_mint cannot sign anything; install a JDK")
+
+    # JAVA_HOME FIRST, because Gradle prefers it over PATH. A java on PATH
+    # therefore proves nothing on its own: observed on the server, a .env
+    # carrying a developer's Windows JAVA_HOME
+    # (C:\Program Files\Android\Android Studio\jbr) made every build die with
+    # "JAVA_HOME is set to an invalid directory" while `java -version`
+    # answered perfectly and this section passed.
+    java_home = os.environ.get("JAVA_HOME", "").strip()
+    if not java_home:
+        # Unset is CORRECT here: gradlew then uses the java on PATH.
+        record("JAVA_HOME is unset, so Gradle uses the java on PATH", "PASS")
+    else:
+        if looks_like_windows_path(java_home):
+            record("JAVA_HOME is a usable directory", "FAIL",
+                   f"{java_home!r} is a Windows path on a Linux host - a "
+                   f"developer's .env was copied here. Gradle prefers "
+                   f"JAVA_HOME over PATH, so this breaks every build while "
+                   f"java -version keeps working")
+        elif not os.path.isdir(java_home):
+            record("JAVA_HOME is a usable directory", "FAIL",
+                   f"{java_home!r} does not exist; Gradle prefers JAVA_HOME "
+                   f"over PATH and refuses to start")
+        elif not os.path.exists(os.path.join(java_home, "bin", "java")):
+            record("JAVA_HOME is a usable directory", "FAIL",
+                   f"{java_home}/bin/java is missing, so it is not a JDK")
+        else:
+            record("JAVA_HOME is a usable directory", "PASS", java_home)
 
     java = shutil.which("java")
     if not java:
