@@ -824,19 +824,53 @@ def generate_all(company: dict, apk_path: Path | None, aab_path: Path | None, ou
             pass
 
     if not policy_url and support_email:
+        # Published on the company's OWN domain, not on freeprivacypolicy.com.
+        #
+        # That site is behind a bot challenge and answers 403 "Just a
+        # moment..." to both login and register, so the old path failed on
+        # every company. It was also the wrong dependency: Play Console will
+        # not accept an app without a policy URL, which makes this document
+        # load-bearing, and a load-bearing legal page should not sit behind a
+        # third party's signup flow, one account per company, revocable at
+        # their discretion.
+        #
+        # privacy_site refuses to publish when the app's observed behaviour
+        # stops supporting the published text, so a failure here can mean
+        # "the app changed and the policy would now be false". That is not
+        # the same as an outage and the log says which.
         try:
-            from .privacy_policy import generate_privacy_policy
-            print(f"  [{cn}] Generating privacy policy via freeprivacypolicy.com…")
-            policy_url = generate_privacy_policy({
+            import sys as _sys
+            from pathlib import Path as _Path
+            _repo = str(_Path(__file__).resolve().parents[2])
+            if _repo not in _sys.path:
+                _sys.path.insert(0, _repo)
+            import privacy_site
+
+            print(f"  [{cn}] Publishing privacy policy on the company's own "
+                  f"domain…")
+            out = privacy_site.publish_policy({
+                "domain": company.get("domain"),
                 "display_name": display_name,
                 "support_email": support_email,
                 "company_name": company.get("company_name") or display_name,
-                "application_id": company.get("application_id"),
                 "company_number": cn,
+                "address": company.get("address") or company.get("legal_address"),
             })
-            print(f"  [{cn}] Privacy policy URL: {policy_url}")
+            status = out.get("status")
+            if status == "published":
+                policy_url = out.get("url")
+                print(f"  [{cn}] Privacy policy URL: {policy_url}")
+            elif status == "refused":
+                print(f"  [{cn}] Privacy policy NOT published: "
+                      f"{out.get('reason')}")
+            elif status == "not_delegated":
+                print(f"  [{cn}] Privacy policy not published yet: "
+                      f"{out.get('message')}")
+            else:
+                print(f"  [{cn}] Privacy policy publish failed: "
+                      f"{out.get('error')}")
         except Exception as e:
-            print(f"  [{cn}] Privacy policy generation failed: {e}")
+            print(f"  [{cn}] Privacy policy publishing raised: {e}")
 
     metadata = {
         "display_name": display_name,

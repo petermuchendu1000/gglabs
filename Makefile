@@ -32,6 +32,7 @@ HERMETIC_TESTS := \
 	test_match_stage.py \
 	test_no_committed_secrets.py \
 	test_play_declarations.py \
+	test_privacy_site.py \
 	test_row_completeness.py \
 	test_stage_feedback.py
 
