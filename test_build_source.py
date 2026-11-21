@@ -22,6 +22,7 @@ the standalone tools work that way. None of the three in-repo callers does.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -332,6 +333,92 @@ def check_gradle_output_is_relayed(r: Results) -> None:
                 "could not start" in buf.getvalue(), repr(buf.getvalue()))
 
 
+def check_broken_java_home_is_dropped(r: Results) -> None:
+    """A JAVA_HOME with no JDK behind it must not be handed to Gradle.
+
+    Seen twice on the server: .env carried a developer's Windows JAVA_HOME
+    (C:\\Program Files\\Android\\Android Studio\\jbr), Gradle preferred it
+    over PATH, and every build died before compiling anything. There is no
+    reading under which a JAVA_HOME containing no bin/java is intentional -
+    it cannot work, for anyone, ever - so the build drops it for the child
+    process and says so loudly rather than failing and leaving the operator
+    to find it.
+
+    Narrow on purpose: a VALID JAVA_HOME is passed through untouched. Picking
+    a JDK is the operator's business whenever their choice can actually run.
+    """
+    import io
+    import types
+    from contextlib import redirect_stdout
+
+    from apps.generator import generate
+
+    print("\n-- a JAVA_HOME with no JDK is dropped, loudly --")
+
+    class _C:
+        company_number = "1"
+        company_name = "X"
+        flavor = "c1"
+
+    def run(java_home):
+        d = tempfile.mkdtemp()
+        g = os.path.join(d, "gradlew")
+        with open(g, "w", encoding="utf-8") as f:
+            f.write('#!/bin/sh\necho "SAW_JAVA_HOME=[${JAVA_HOME:-unset}]"\n'
+                    "exit 0\n")
+        os.chmod(g, 0o755)
+        saved_root = generate.TEMPLATE_ROOT
+        saved_jh = os.environ.get("JAVA_HOME")
+        generate.TEMPLATE_ROOT = d
+        if java_home is None:
+            os.environ.pop("JAVA_HOME", None)
+        else:
+            os.environ["JAVA_HOME"] = java_home
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                generate.run_gradle([types.SimpleNamespace(company=_C())])
+            return buf.getvalue()
+        finally:
+            generate.TEMPLATE_ROOT = saved_root
+            os.environ.pop("JAVA_HOME", None)
+            if saved_jh is not None:
+                os.environ["JAVA_HOME"] = saved_jh
+
+    out = run(r"C:\Program Files\Android\Android Studio\jbr")
+    r.check("the child does NOT receive a broken JAVA_HOME",
+            "SAW_JAVA_HOME=[unset]" in out,
+            "Gradle would prefer it over PATH and refuse to start: " + repr(out))
+    r.check("...and the drop is announced", "JAVA_HOME" in out and
+            "bin/java" in out, repr(out))
+    r.check("...and the operator is pointed at the source",
+            ".env" in out, "nothing says where to fix it: " + repr(out))
+
+    # The control: a REAL JDK layout must be passed through untouched, or
+    # this is just "always unset JAVA_HOME", which would override a
+    # deliberate choice of JDK.
+    jdk = tempfile.mkdtemp()
+    os.makedirs(os.path.join(jdk, "bin"), exist_ok=True)
+    with open(os.path.join(jdk, "bin", "java"), "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(os.path.join(jdk, "bin", "java"), 0o755)
+    try:
+        out = run(jdk)
+        r.check("a valid JAVA_HOME is passed through unchanged",
+                f"SAW_JAVA_HOME=[{jdk}]" in out,
+                "a deliberate JDK choice was overridden: " + repr(out))
+        r.check("...and nothing is announced about it",
+                "bin/java" not in out,
+                "a working configuration was reported as a problem")
+    finally:
+        shutil.rmtree(jdk, ignore_errors=True)
+
+    out = run(None)
+    r.check("an unset JAVA_HOME stays unset and is not announced",
+            "SAW_JAVA_HOME=[unset]" in out and "bin/java" not in out,
+            repr(out))
+
+
 def main() -> int:
     r = Results()
     print(f"target: apps/generator/catalog.load_companies (stage 5's source)")
@@ -341,6 +428,7 @@ def main() -> int:
     check_filters(r)
     check_callers(r)
     check_gradle_output_is_relayed(r)
+    check_broken_java_home_is_dropped(r)
     return r.report()
 
 

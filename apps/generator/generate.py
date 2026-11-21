@@ -95,6 +95,33 @@ def run_gradle(built: list[BuiltFlavor], variant: str = "Release", artifact: str
 
     cmd = [gradlew, "--no-daemon", "--console=plain", "--stacktrace", *tasks]
     print(f"\n  Gradle: {' '.join(tasks)}")
+
+    # A JAVA_HOME with no JDK behind it is dropped for the child.
+    #
+    # Gradle PREFERS JAVA_HOME over PATH, so one stale line in .env - on this
+    # server, a developer's C:\Program Files\Android\Android Studio\jbr -
+    # kills every build before it compiles anything, while `java -version`
+    # keeps answering and looks fine. It cost two diagnosis cycles.
+    #
+    # This is narrow on purpose. There is no reading under which a JAVA_HOME
+    # containing no bin/java is intentional: it cannot work, for anyone,
+    # ever. A VALID JAVA_HOME is passed through untouched, because choosing
+    # which JDK to build with is the operator's business whenever the choice
+    # can actually run. And the drop is announced, with where to fix it,
+    # rather than quietly papering over a broken deployment.
+    env = os.environ.copy()
+    java_home = env.get("JAVA_HOME", "").strip()
+    if java_home and not any(
+            os.path.exists(os.path.join(java_home, "bin", exe))
+            for exe in ("java", "java.exe")):
+        print(f"    JAVA_HOME={java_home!r} contains no bin/java, so Gradle "
+              f"would refuse to start.")
+        print("    Dropping it for this build; gradlew will use the java on "
+              "PATH instead.")
+        print("    Fix it at source - it is almost certainly a stale line in "
+              ".env or the unit.")
+        env.pop("JAVA_HOME", None)
+
     t0 = time.time()
 
     # Gradle's output is RELAYED through print(), not inherited.
@@ -113,7 +140,7 @@ def run_gradle(built: list[BuiltFlavor], variant: str = "Release", artifact: str
     try:
         proc = subprocess.Popen(cmd, cwd=TEMPLATE_ROOT, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
-                                bufsize=1)
+                                bufsize=1, env=env)
     except OSError as e:
         # errno 13 without the exec bit, errno 8 for a bad format. Both used
         # to escape as an uncaught exception from inside a worker thread.
