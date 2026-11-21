@@ -1485,6 +1485,7 @@ function renderDetail() {
       ${icDuns(d.duns)}
       ${icDomain(d.domain)}
       ${icEmail(d.email)}
+      ${icPrivacy(d.privacy_policy_url, d.domain)}
     </div>
 
     <div class="stages-section">
@@ -1815,6 +1816,35 @@ function icEmail(val) {
         ? `— <a class="ic-action" onclick="runStage('email')">Run Email stage →</a>`
         : `<a class="ic-link" href="mailto:${x(val)}">${x(val)}</a>`
       }
+    </div>
+  </div>`;
+}
+
+function icPrivacy(val, domain) {
+  // Play Console will not accept an app without this URL, and it is the one
+  // field here a human has to paste into Google by hand - so it sits with
+  // Domain and Email rather than only inside the collapsed Play Console
+  // section, and it copies in one click.
+  const empty = !val || val === "None";
+  if (empty) {
+    // Say which stage, and say what has to be true first. "Run the App
+    // stage" on an undelegated domain sends somebody round a loop: the
+    // policy is served from the company's own domain, so the zone has to
+    // exist before there is anywhere to publish it.
+    const why = (!domain || domain === "None")
+      ? `— <span class="empty">needs a domain first</span>`
+      : `— <a class="ic-action" onclick="runStage('app')">Run App stage →</a>`;
+    return `<div class="info-card">
+      <div class="info-label">Privacy Policy</div>
+      <div class="info-value empty">${why}</div>
+    </div>`;
+  }
+  return `<div class="info-card">
+    <div class="info-label">Privacy Policy</div>
+    <div class="info-value" style="font-size:12px">
+      <a class="ic-link" href="${x(val)}" target="_blank" rel="noopener">${x(val)} ↗</a>
+      <button class="ic-copy-btn" title="Copy privacy policy URL"
+        onclick="navigator.clipboard.writeText(${JSON.stringify(val)}).then(()=>toast('Privacy policy URL copied','success'))">⧉</button>
     </div>
   </div>`;
 }

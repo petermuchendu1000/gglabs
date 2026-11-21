@@ -264,6 +264,42 @@ def check_it_is_wired_against_the_same_source(r: Results) -> None:
             repr(decl["summary"]["needs_human"]))
 
 
+def check_the_dashboard_shows_it(r: Results) -> None:
+    """The URL is the one field a human must paste into Google by hand.
+
+    It existed only inside the collapsible Play Console section. Play will
+    not accept an app without it, so it belongs beside Domain and Email
+    where somebody looking for it will find it, and it has to copy in one
+    click.
+    """
+    print("\n-- the dashboard surfaces the policy URL --")
+    html = open(os.path.join(REPO, "static", "app.html"),
+                encoding="utf-8").read()
+    r.check("there is a Privacy Policy card", "function icPrivacy(" in html,
+            "the URL is only inside the collapsed Play Console section")
+    r.check("...and it is in the top info grid",
+            "${icPrivacy(d.privacy_policy_url, d.domain)}" in html,
+            "the card is defined but never rendered")
+    r.check("...and it copies to the clipboard",
+            "Privacy policy URL copied" in html,
+            "a URL you cannot copy is a URL you retype wrongly")
+    r.check("...and links out to verify it is really live",
+            'href="${x(val)}" target="_blank"' in html, "no way to check it")
+
+    # The empty state must not send somebody round a loop: the policy is
+    # served from the company's own domain, so a company with no domain
+    # cannot get one by running the App stage.
+    r.check("an empty card distinguishes 'no domain' from 'run the stage'",
+            "needs a domain first" in html and "runStage('app')" in html,
+            "it would tell an operator to run a stage that cannot succeed")
+
+    # And the API must actually send the field.
+    api = open(os.path.join(REPO, "api_v2.py"), encoding="utf-8").read()
+    r.check("api_v2 exposes privacy_policy_url to the dashboard",
+            '"privacy_policy_url": privacy_url' in api,
+            "the card would always render empty")
+
+
 def main() -> int:
     r = Results()
     print("test_privacy_site.py - a published policy is a claim about software")
@@ -275,6 +311,7 @@ def main() -> int:
     check_dry_run_writes_nothing(r)
     check_worker_matches_the_facts(r)
     check_it_is_wired_against_the_same_source(r)
+    check_the_dashboard_shows_it(r)
     return r.report()
 
 

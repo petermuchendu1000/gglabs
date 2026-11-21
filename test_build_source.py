@@ -420,6 +420,49 @@ def check_broken_java_home_is_dropped(r: Results) -> None:
             repr(out))
 
 
+def check_no_blanket_keep_rules(r: Results) -> None:
+    """A blanket -keep on a library switches tree-shaking off for it.
+
+    proguard-rules.pro carried `-keep class androidx.compose.** { *; }`.
+    R8 ran on every build and was then told to discard nothing from the
+    toolkit that makes up almost the whole app. Measured on the 16811331
+    bundle, before and after removing that one line:
+
+      classes.dex          17.45 MB raw / 5.60 MB  ->  1.78 MB / 0.87 MB
+      classes in the dex   19,171                  ->  2,500
+      androidx/compose/material icon classes 11,400 -> 0  (20 are used)
+      proguard.map         176 MB raw / 11.22 MB   ->  22 MB / 1.65 MB
+      the .aab             17.3 MB                 ->  2.6 MB
+
+    Compose needs no keep rule: each artifact ships consumer rules in its
+    AAR and AGP keeps whatever the manifest names. The guard is here because
+    the rule is easy to re-add from a stale answer online, the build keeps
+    succeeding when it comes back, and the only symptom is an app six times
+    larger than it needs to be.
+    """
+    print("\n-- no blanket -keep rules in proguard-rules.pro --")
+    path = os.path.join(REPO, "apps", "template-shift-journal", "app",
+                        "proguard-rules.pro")
+    lines = [l.strip() for l in open(path, encoding="utf-8").read().splitlines()
+             if l.strip() and not l.strip().startswith("#")]
+    r.check("the rules file is readable and has content", bool(lines), path)
+
+    blanket = [l for l in lines
+               if re.match(r"^-keep(class|classeswithmembers)?\s+class\s+"
+                           r"[\w.]*\*\*", l) and "{ *; }" in l.replace(" ", " ")]
+    r.check("no rule keeps an entire library tree", not blanket,
+            "tree-shaking is off for these, and the app ships every class "
+            "in them: " + "; ".join(blanket))
+
+    # The control: the predicate must actually recognise the rule that was
+    # removed, or "no offenders" means the matcher is broken.
+    sample = "-keep class androidx.compose.** { *; }"
+    r.check("the matcher recognises the rule that caused this",
+            bool(re.match(r"^-keep(class|classeswithmembers)?\s+class\s+"
+                          r"[\w.]*\*\*", sample)) and "{ *; }" in sample,
+            "the check above would pass against anything")
+
+
 def check_no_developer_machine_paths(r: Results) -> None:
     """A Windows path compiled into a module that runs on a Linux server.
 
@@ -543,6 +586,7 @@ def main() -> int:
     check_callers(r)
     check_gradle_output_is_relayed(r)
     check_broken_java_home_is_dropped(r)
+    check_no_blanket_keep_rules(r)
     check_no_developer_machine_paths(r)
     check_stage_build_requires_android_home(r)
     return r.report()
