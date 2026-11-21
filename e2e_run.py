@@ -33,6 +33,7 @@ but where it will run - see the CREDENTIALS note in cloudflare_dns.py.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import traceback
 from datetime import datetime
@@ -61,6 +62,42 @@ NO_STICK = "no_stick"
 
 
 # ── Pure decisions, so they can be tested without a provider ───────────────
+
+def root_guard(euid: int, service_user: str, allow_root: bool) -> str | None:
+    """Refuse to run as root on a box where a service user owns the pipeline.
+
+    Returns the refusal message, or None to proceed.
+
+    WHY THIS IS NOT FUSSINESS. Observed 2026-11-21: a console run of this
+    harness, as root, created app/src/c16811331 owned by root:root 755. The
+    next dashboard run died in shutil.rmtree with "Permission denied:
+    'colors.xml'" - write_flavor_resources deletes and recreates that
+    directory on every run, and the service user cannot empty a root-owned
+    one. app/src itself was already pipeline-owned; root's run had left
+    behind exactly one directory, and one was enough.
+
+    What makes it worth refusing rather than warning is that the root run
+    reports NOTHING wrong. Root ignores file modes, so it gets further than
+    the service ever will, and the damage is invisible from the console that
+    caused it. The operator sees a later, unrelated error - in this case a
+    bad JAVA_HOME - fixes that, and the dashboard still fails for a reason
+    the console cannot reproduce.
+    """
+    if allow_root or euid != 0 or not service_user:
+        return None
+    return (
+        "Refusing to run as root: this pipeline's service runs as "
+        f"{service_user!r}, and anything root creates here - the flavour "
+        f"overlay under app/src above all - is left owned by root and the "
+        f"service can no longer delete it. The next dashboard run then fails "
+        f"with a PermissionError that cannot be reproduced from this "
+        f"console, because root ignores the modes that stop it.\n"
+        f"  Run it as the service user instead:\n"
+        f"    sudo -u {service_user} .venv/bin/python e2e_run.py <args>\n"
+        f"  Or pass --allow-root if you have a reason and will fix the "
+        f"ownership afterwards."
+    )
+
 
 def plan_stage(stage: str, is_done: bool, allow_spend: bool) -> str:
     """What should happen to one stage: RUN, ALREADY or BLOCKED."""
@@ -274,7 +311,22 @@ def main() -> int:
                    help="director nationality to search for with --find")
     p.add_argument("--only", default="",
                    help="comma-separated subset of stages to consider")
+    p.add_argument("--allow-root", action="store_true",
+                   help="run as root anyway, leaving files the service user "
+                        "cannot delete")
     a = p.parse_args()
+
+    # Before anything touches the filesystem. The service user is read from
+    # the unit rather than assumed, so a box with no unit is unaffected.
+    try:
+        from deploy_check import service_user
+        user = service_user()
+    except Exception:
+        user = ""
+    refusal = root_guard(os.geteuid(), user, a.allow_root)
+    if refusal:
+        print(refusal)
+        return 2
 
     import pipeline
     pipeline._load_env()

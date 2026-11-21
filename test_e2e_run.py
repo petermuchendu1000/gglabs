@@ -325,6 +325,85 @@ def _called_names(path: str) -> set[str]:
     return out
 
 
+def check_running_as_root_is_refused(r: Results) -> None:
+    """Running this harness as root poisons the service, silently.
+
+    Observed 2026-11-21. A console run as root created
+    app/src/c16811331 owned by root:root 755. The next dashboard run died in
+    shutil.rmtree with "Permission denied: 'colors.xml'", because
+    write_flavor_resources deletes and recreates that directory every time
+    and the service user cannot empty a root-owned one. app/src itself was
+    pipeline-owned - root's run had left exactly one directory behind, and
+    that was enough.
+
+    The root run reports nothing wrong. It gets further than the service
+    ever will, so the damage is invisible from the console that caused it.
+    """
+    print("\n-- the harness refuses to run as root --")
+
+    msg = e2e_run.root_guard(euid=0, service_user="pipeline",
+                             allow_root=False)
+    r.check("root with a service user configured is refused", bool(msg),
+            "the run would leave root-owned files the service cannot delete")
+    r.check("...and the message names the service user",
+            "pipeline" in (msg or ""), repr(msg))
+    r.check("...and tells the operator how to run it properly",
+            "sudo -u pipeline" in (msg or ""), repr(msg))
+    r.check("...and names the escape hatch",
+            "--allow-root" in (msg or ""), repr(msg))
+
+    # The controls. Each must be capable of returning None, or the guard is
+    # simply "always refuse" and would be switched off within a day.
+    r.check("the service user itself is allowed",
+            e2e_run.root_guard(euid=999, service_user="pipeline",
+                               allow_root=False) is None,
+            "the correct way to run it was blocked")
+    r.check("root with --allow-root is allowed",
+            e2e_run.root_guard(euid=0, service_user="pipeline",
+                               allow_root=True) is None,
+            "the escape hatch does nothing")
+    r.check("root on a box with no service user is allowed",
+            e2e_run.root_guard(euid=0, service_user="", allow_root=False)
+            is None,
+            "a developer machine with no systemd unit cannot run the "
+            "harness at all")
+
+
+def check_main_actually_runs(r: Results) -> None:
+    """Exercise main(), not just the predicate it calls.
+
+    The predicate tests above all passed while main() carried a NameError:
+    it called os.geteuid() and e2e_run did not import os. A pure function
+    tested in isolation says nothing about the entry point that calls it,
+    and this entry point is the only way anybody runs the harness.
+    """
+    print("\n-- main() reaches the guard without blowing up --")
+    saved_argv = sys.argv
+    buf = io.StringIO()
+    try:
+        sys.argv = ["e2e_run.py", "--company", "00000001"]
+        with redirect_stdout(buf):
+            code = e2e_run.main()
+    except Exception as exc:                    # noqa: BLE001
+        r.check("main() runs without raising", False,
+                f"{type(exc).__name__}: {exc}")
+        return
+    finally:
+        sys.argv = saved_argv
+    out = buf.getvalue()
+
+    # In this container euid is 0 and the unit names a service user, so the
+    # guard must fire. That is also the server's situation.
+    if os.geteuid() == 0:
+        r.check("main() refuses as root and exits non-zero", code == 2,
+                f"exit {code}: {out[-300:]!r}")
+        r.check("...with the refusal text", "Refusing to run as root" in out,
+                repr(out[:200]))
+    else:
+        r.check("main() got past the guard as a non-root user",
+                "Refusing to run as root" not in out, repr(out[:200]))
+
+
 def check_it_is_not_a_second_pipeline(r: Results) -> None:
     """The harness must delegate, not reimplement. If it ever grows its own
     idea of what a stage does, a green run here stops saying anything about
@@ -362,6 +441,8 @@ def main() -> int:
     check_no_stick_alone_is_not_a_proof(r)
     check_a_failure_that_reads_complete_still_halts(r)
     check_only_subset(r)
+    check_running_as_root_is_refused(r)
+    check_main_actually_runs(r)
     check_it_is_not_a_second_pipeline(r)
     return r.report()
 
