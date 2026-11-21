@@ -764,22 +764,44 @@ def _exec_stage(cn: str, stage: str, row: dict):
                          or f"delegation of {domain} reported {status!r}"}
 
     elif stage == "email":
-        from email_pool import EmailPool
-        pool = EmailPool()
-        ex_email, ex_first, ex_last = pool.get_assigned_email(cn)
-        if ex_email:
-            # Already assigned in pool — sync to Excel if missing
-            if not str(row.get("Assigned Email") or ""):
+        # THE ROW FIRST, and the pool only if the row has nothing.
+        #
+        # EmailPool._load raises FileNotFoundError when emails.xlsx is absent,
+        # and this stage used to build one as its very first act - before
+        # anything asked whether a pool was needed at all. So a company whose
+        # address was already assigned could not re-run the stage on a server
+        # without the spreadsheet, and died with a missing-file error that
+        # said nothing about dev@ routing.
+        #
+        # That matters more than it looks, because repairing a dev@ route is
+        # now the COMMON re-run: _compute_stages requires Dev Email
+        # Forwarding == "configured" before it calls this stage done, so a
+        # company with a broken route comes back here every time. The one
+        # path that fixes the route was the one path a missing pool blocked.
+        #
+        # The pool's job is to hand out an address nobody holds yet. An
+        # address already on the row is not that job.
+        row_email = str(row.get("Assigned Email") or "").strip()
+        if row_email:
+            print(f"  email: {row_email} (already assigned to this company)")
+            email, assigned = row_email, "already_assigned"
+        else:
+            from email_pool import EmailPool
+            pool = EmailPool()
+            ex_email, ex_first, ex_last = pool.get_assigned_email(cn)
+            if ex_email:
+                # Assigned in the pool but not yet on the row — sync it.
                 _update_excel_row(cn, {"Assigned Email": ex_email,
                                        "Account Name": f"{ex_first} {ex_last}"})
-            print(f"  email: {ex_email} (already assigned to this company)")
-            email, assigned = ex_email, "already_assigned"
-        else:
-            email, first, last = pool.assign_next(company_number=cn, company_name=name)
-            _update_excel_row(cn, {"Assigned Email": email,
-                                    "Account Name": f"{first} {last}"})
-            print(f"  email: {email} assigned from the pool")
-            assigned = "assigned"
+                print(f"  email: {ex_email} (already assigned to this company)")
+                email, assigned = ex_email, "already_assigned"
+            else:
+                email, first, last = pool.assign_next(company_number=cn,
+                                                      company_name=name)
+                _update_excel_row(cn, {"Assigned Email": email,
+                                       "Account Name": f"{first} {last}"})
+                print(f"  email: {email} assigned from the pool")
+                assigned = "assigned"
 
         # dev@<domain> has to forward to the Gmail account that owns the Play
         # Console listing, and it is a BLOCKING readiness check

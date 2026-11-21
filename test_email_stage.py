@@ -484,6 +484,123 @@ def check_a_broken_dev_route_does_not_mark_the_stage_complete(r: Results) -> Non
             s.get("email") is False, repr(s))
 
 
+def check_route_repair_does_not_need_the_pool(r: Results) -> None:
+    """A company that HAS an address must not need emails.xlsx to re-run.
+
+    Observed on the server: the email stage died with
+
+      FileNotFoundError: Emails file not found: .../emails.xlsx
+
+    on a company whose row already carried Assigned Email. The stage builds
+    an EmailPool as its first act, and EmailPool._load raises when the
+    spreadsheet is absent - before anything asks whether a pool is needed.
+
+    The pool exists to hand out an address nobody has yet. Re-running the
+    stage to REPAIR a dev@ route needs no such thing: the address is on the
+    row. And repairing the route is now the common re-run, because
+    _compute_stages requires Dev Email Forwarding == "configured" before it
+    calls the stage done - so the one path that fixes a broken route was the
+    one path a missing pool file blocked.
+    """
+    print("\n-- repairing a dev@ route needs no pool file --")
+    import api_v2
+
+    class PoolIsGone:
+        def __init__(self, *a, **k):
+            raise FileNotFoundError(
+                "Emails file not found: /opt/company_registration/emails.xlsx")
+
+    import email_pool
+    wrote = {}
+    routed = []
+
+    def fake_route(domain, worker=None, forward_to=None, **kw):
+        routed.append({"domain": domain, "worker": worker,
+                       "forward_to": forward_to})
+        return route(target="worker:pipeline-email")
+
+    saved = (email_pool.EmailPool, api_v2._update_excel_row,
+             cloudflare_dns.ensure_dev_route)
+    email_pool.EmailPool = PoolIsGone
+    api_v2._update_excel_row = lambda cn, updates: wrote.update(updates)
+    cloudflare_dns.ensure_dev_route = fake_route
+    try:
+        out = io.StringIO()
+        with redirect_stdout(out):
+            result = api_v2._exec_stage("16811331", "email", {
+                "Company Name": "SIMON MWANGI LTD",
+                "Domain": "simon-mwangi.site",
+                "Assigned Email": "simonmwan50@gmail.com",
+            })
+    except FileNotFoundError as e:
+        result, out = None, io.StringIO()
+        r.check("the stage runs without emails.xlsx", False,
+                f"it still raises: {e}")
+    finally:
+        (email_pool.EmailPool, api_v2._update_excel_row,
+         cloudflare_dns.ensure_dev_route) = saved
+
+    if result is None:
+        return
+    r.check("the stage runs without emails.xlsx", True)
+    r.check("...and keeps the address already on the row",
+            result.get("email") == "simonmwan50@gmail.com", repr(result))
+    r.check("...and still configures the route",
+            routed and routed[0]["domain"] == "simon-mwangi.site",
+            repr(routed))
+    r.check("...and records the ROUTE STATUS, not an address",
+            wrote.get("Dev Email Forwarding") == "configured",
+            f"wrote {wrote!r}; a column that holds an address instead of a "
+            f"status can never satisfy _compute_stages, so the stage would "
+            f"re-run for ever")
+    r.check("...and reports success", result.get("status") == "already_assigned",
+            repr(result))
+
+
+def check_a_company_with_no_address_still_needs_the_pool(r: Results) -> None:
+    """The control. If the stage stopped using the pool altogether, the check
+    above would pass while no company could ever be assigned an address."""
+    print("\n-- a company with NO address still uses the pool --")
+    import api_v2
+    import email_pool
+
+    asked = []
+
+    class Pool:
+        def __init__(self, *a, **k):
+            asked.append("constructed")
+
+        def get_assigned_email(self, cn):
+            return None, None, None
+
+        def assign_next(self, company_number=None, company_name=""):
+            asked.append(("assign_next", company_number))
+            return "fresh@real.example", "Fresh", "User"
+
+    wrote = {}
+    saved = (email_pool.EmailPool, api_v2._update_excel_row,
+             cloudflare_dns.ensure_dev_route)
+    email_pool.EmailPool = Pool
+    api_v2._update_excel_row = lambda cn, updates: wrote.update(updates)
+    cloudflare_dns.ensure_dev_route = lambda domain, **kw: route()
+    try:
+        with redirect_stdout(io.StringIO()):
+            result = api_v2._exec_stage("00000002", "email", {
+                "Company Name": "NEW CO LTD",
+                "Domain": "newco.example",
+                "Assigned Email": "",
+            })
+    finally:
+        (email_pool.EmailPool, api_v2._update_excel_row,
+         cloudflare_dns.ensure_dev_route) = saved
+
+    r.check("the pool is consulted", "constructed" in asked, repr(asked))
+    r.check("...and an address is assigned from it",
+            result.get("email") == "fresh@real.example", repr(result))
+    r.check("...and written to the row",
+            wrote.get("Assigned Email") == "fresh@real.example", repr(wrote))
+
+
 def check_print_summary(r: Results) -> None:
     print("\n-- print_summary reads what the build wrote --")
     tmp = tempfile.mkdtemp()
@@ -617,6 +734,8 @@ def main() -> int:
     check_manifest(r)
     check_unrouted_company_does_not_get_a_support_email(r)
     check_a_broken_dev_route_does_not_mark_the_stage_complete(r)
+    check_route_repair_does_not_need_the_pool(r)
+    check_a_company_with_no_address_still_needs_the_pool(r)
     check_print_summary(r)
     check_co_dir_matches_writer(r)
     check_no_db_write(r)
