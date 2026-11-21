@@ -386,6 +386,94 @@ def check_android_installer(r: Results) -> None:
             'id -u' in text,
             "it would fail half way with a confusing permission error")
     check_protecthome_caches(r, text)
+    import deploy_check
+    check_stage_env_table(r, deploy_check)
+
+
+def check_stage_env_table(r: Results, deploy_check) -> None:
+    """Section 10 names which STAGE each variable belongs to.
+
+    Three deploys running were diagnosed by reading a traceback - ANDROID_HOME,
+    GRADLE_USER_HOME, then CLOUDFLARE_EMAIL_WORKER. The last is the worst,
+    because nothing raises: the email stage degrades to a forward Cloudflare
+    will not deliver, and reports pending_verification, which reads like a
+    human forgot to click a link.
+    """
+    print("\n-- deploy_check section 10: per-stage environment --")
+    import io
+    from contextlib import redirect_stdout
+
+    def run(env: dict):
+        names = set()
+        for _s, group, _b in deploy_check.STAGE_ENV:
+            for n in group:
+                names.update((n,) if isinstance(n, str) else n)
+        names.update({"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"})
+        saved = {n: os.environ.get(n) for n in names}
+        saved_results = deploy_check.RESULTS
+        deploy_check.RESULTS = []
+        for n in names:
+            os.environ.pop(n, None)
+        os.environ.update(env)
+        try:
+            with redirect_stdout(io.StringIO()):
+                deploy_check.check_pipeline_env()
+            return list(deploy_check.RESULTS)
+        finally:
+            deploy_check.RESULTS = saved_results
+            for n in names:
+                os.environ.pop(n, None)
+            for n, v in saved.items():
+                if v is not None:
+                    os.environ[n] = v
+
+    def fails(results):
+        return [f"{n}: {d}" for n, s, d in results if s == "FAIL"]
+
+    # Nothing set: every stage must complain, each naming its own variables.
+    out = run({})
+    for stage, _group, _b in deploy_check.STAGE_ENV:
+        r.check(f"{stage}: reported missing when unset",
+                any(f.startswith(stage) for f in fails(out)),
+                f"a missing variable for this stage passes silently: "
+                f"{fails(out)!r}")
+
+    # The email entry must spell out the consequence, not just the name: the
+    # whole point is that the symptom does not look like a missing setting.
+    email_fail = next((f for f in fails(out) if f.startswith("email")), "")
+    r.check("the email entry explains the silent degradation",
+            "pending_verification" in email_fail and "FORWARD" in email_fail,
+            "an operator reads the symptom and goes to open a mailbox: "
+            + repr(email_fail))
+
+    # IBENTY_* or the older XBINDER_* - either satisfies director_id, because
+    # a .env written before the rename is still a configured box.
+    for pair in (("IBENTY_EMAIL", "IBENTY_PASSWORD"),
+                 ("XBINDER_EMAIL", "XBINDER_PASSWORD")):
+        out = run({pair[0]: "a@b.invalid", pair[1]: "secret"})
+        r.check(f"director_id accepts {pair[0].split('_')[0]}_*",
+                not any(f.startswith("director_id") for f in fails(out)),
+                f"a configured box is reported unconfigured: {fails(out)!r}")
+    # The control: a half-set pair is NOT enough.
+    out = run({"IBENTY_EMAIL": "a@b.invalid"})
+    r.check("an email with no password is still missing",
+            any(f.startswith("director_id") for f in fails(out)),
+            "half a credential passed as a whole one")
+
+    # A worker that is set but names nothing is worse than one unset: the
+    # rule is written, reads configured, and delivers to nothing.
+    out = run({"CLOUDFLARE_EMAIL_WORKER": "x"})
+    r.check("a set worker is not reported missing",
+            not any(f.startswith("email") for f in fails(out)),
+            repr(fails(out)))
+    r.check("...and its existence is checked separately",
+            any("Worker" in n for n, _s, _d in out),
+            "a typo in the script name would never be noticed: "
+            + repr([n for n, _s, _d in out]))
+    r.check("...and SKIPs rather than passes with no credential",
+            any("Worker" in n and s == "SKIP" for n, s, _d in out),
+            "it cannot be asked without a token, and 'could not ask' must "
+            "not read as 'the worker is fine'")
 
 
 def check_protecthome_caches(r: Results, installer: str) -> None:

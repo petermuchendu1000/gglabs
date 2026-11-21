@@ -849,12 +849,25 @@ def _exec_stage(cn: str, stage: str, row: dict):
             # pass Play Console review and cannot receive Google's code, so
             # the stage has not finished its job. Re-running is safe -
             # assigning an email and setting a route are both idempotent.
+            why = (route.get("message") or route.get("error")
+                   or "no reason given")
+            # Name the CAUSE, not only the symptom. With no worker configured
+            # the code falls back to forwarding to the company's own mailbox,
+            # and Cloudflare refuses to deliver to an address nobody has
+            # verified - so the stage reports pending_verification, which
+            # reads like a human forgot to click a link rather than like a
+            # setting nobody made. The distinction decides whether the
+            # operator opens a mailbox or edits .env.
+            if not worker and route_status == "pending_verification":
+                why += (". CLOUDFLARE_EMAIL_WORKER is not set, which is why a "
+                        "forward was attempted at all: with it set to a "
+                        "deployed Email Worker's script name, the route needs "
+                        "no verification and no mailbox has to be opened")
             return {
                 "status": "error",
                 "email": email,
                 "error": (f"the email {email} is assigned, but dev@{domain} "
-                          f"routing is {route_status}: "
-                          f"{route.get('message') or route.get('error') or 'no reason given'}"),
+                          f"routing is {route_status}: {why}"),
             }
         return {"email": email, "status": assigned,
                 "dev_email_forwarding": route_status,

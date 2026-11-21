@@ -601,6 +601,63 @@ def check_a_company_with_no_address_still_needs_the_pool(r: Results) -> None:
             wrote.get("Assigned Email") == "fresh@real.example", repr(wrote))
 
 
+def check_missing_worker_is_named_as_the_cause(r: Results) -> None:
+    """pending_verification reads like a human forgot to click a link.
+
+    With CLOUDFLARE_EMAIL_WORKER unset the stage falls back to forwarding to
+    the company's own mailbox, and Cloudflare refuses to deliver to an
+    unverified address - so the symptom is identical to "somebody has not
+    clicked the link yet", while the cause is a setting nobody made. The
+    difference decides whether an operator opens a mailbox or edits .env, so
+    the message has to say which.
+    """
+    print("\n-- an unset worker is named, not just its symptom --")
+    import api_v2
+    import email_pool
+
+    def run(worker_value):
+        saved_env = os.environ.get("CLOUDFLARE_EMAIL_WORKER")
+        saved = (api_v2._update_excel_row, cloudflare_dns.ensure_dev_route,
+                 email_pool.EmailPool)
+        if worker_value is None:
+            os.environ.pop("CLOUDFLARE_EMAIL_WORKER", None)
+        else:
+            os.environ["CLOUDFLARE_EMAIL_WORKER"] = worker_value
+        api_v2._update_excel_row = lambda cn, updates: None
+        cloudflare_dns.ensure_dev_route = lambda domain, **kw: {
+            "status": "pending_verification", "address": f"dev@{domain}",
+            "message": "nobody has verified owner@real.example"}
+        try:
+            with redirect_stdout(io.StringIO()):
+                return api_v2._exec_stage("00000001", "email", {
+                    "Company Name": "ACME LTD", "Domain": "acme.uk",
+                    "Assigned Email": "owner@real.example"})
+        finally:
+            (api_v2._update_excel_row, cloudflare_dns.ensure_dev_route,
+             email_pool.EmailPool) = saved
+            os.environ.pop("CLOUDFLARE_EMAIL_WORKER", None)
+            if saved_env is not None:
+                os.environ["CLOUDFLARE_EMAIL_WORKER"] = saved_env
+
+    out = run(None)
+    r.check("the stage still fails", out.get("status") == "error", repr(out))
+    r.check("...and names CLOUDFLARE_EMAIL_WORKER as the cause",
+            "CLOUDFLARE_EMAIL_WORKER" in str(out.get("error")),
+            "the operator would go and open a mailbox instead of setting a "
+            "variable: " + repr(out.get("error")))
+    r.check("...and still carries the provider's own reason",
+            "nobody has verified" in str(out.get("error")), repr(out))
+
+    # The control: with a worker configured, the same pending_verification
+    # is NOT blamed on the variable - that would be a false explanation.
+    out = run("pipeline-email")
+    r.check("with a worker set, the variable is NOT blamed",
+            "CLOUDFLARE_EMAIL_WORKER" not in str(out.get("error")),
+            "a configured worker was reported as the problem: " + repr(out))
+    r.check("...and the real reason is still reported",
+            "nobody has verified" in str(out.get("error")), repr(out))
+
+
 def check_print_summary(r: Results) -> None:
     print("\n-- print_summary reads what the build wrote --")
     tmp = tempfile.mkdtemp()
@@ -736,6 +793,7 @@ def main() -> int:
     check_a_broken_dev_route_does_not_mark_the_stage_complete(r)
     check_route_repair_does_not_need_the_pool(r)
     check_a_company_with_no_address_still_needs_the_pool(r)
+    check_missing_worker_is_named_as_the_cause(r)
     check_print_summary(r)
     check_co_dir_matches_writer(r)
     check_no_db_write(r)

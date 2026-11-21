@@ -497,6 +497,99 @@ def check_build_toolchain() -> None:
                f"so without the bit it raises errno 13")
 
 
+# Which stage stops working, and how, when a variable is missing. Written as
+# a table because the failures do not look alike: some raise, some return an
+# error, and CLOUDFLARE_EMAIL_WORKER quietly degrades to a route that cannot
+# deliver. Each entry is (stage, names, what breaks). A tuple inside `names`
+# means "any one of these".
+STAGE_ENV = (
+    ("details, certificate", ("COMPANIES_HOUSE_API_KEY",),
+     "Companies House returns 401 and no company data or certificate arrives"),
+    ("domain", ("NAMECHEAP_API_KEY", "NAMECHEAP_API_USER",
+                "NAMECHEAP_USERNAME", "NAMECHEAP_CLIENT_IP"),
+     "no domain can be priced or bought; NAMECHEAP_CLIENT_IP must be the "
+     "address Namecheap has allowlisted for this account"),
+    ("delegate", ("CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"),
+     "no zone can be created, so no domain can be delegated"),
+    ("email", ("CLOUDFLARE_EMAIL_WORKER",),
+     "dev@ falls back to FORWARDING to the company's own mailbox, which "
+     "Cloudflare refuses to deliver to until a human opens it and clicks a "
+     "link - one manual step per company, and the stage reports "
+     "pending_verification every time"),
+    ("director_id", (("IBENTY_EMAIL", "XBINDER_EMAIL"),
+                     ("IBENTY_PASSWORD", "XBINDER_PASSWORD")),
+     "the stage returns without doing anything"),
+)
+
+
+def check_pipeline_env() -> None:
+    """The variables each STAGE needs, checked before a stage needs them.
+
+    Three deploys in a row were diagnosed by running the pipeline and reading
+    a traceback: ANDROID_HOME, then GRADLE_USER_HOME, then
+    CLOUDFLARE_EMAIL_WORKER. The last is the worst of the three because
+    nothing raises - the email stage silently falls back to a forward that
+    Cloudflare will not deliver, and the failure arrives as
+    "pending_verification", which reads like somebody forgot to click a link
+    rather than like a missing setting.
+    """
+    section("10. Pipeline environment (per stage)")
+    for stage, names, breaks in STAGE_ENV:
+        missing = []
+        for name in names:
+            alts = (name,) if isinstance(name, str) else name
+            if not any(os.environ.get(a, "").strip() for a in alts):
+                missing.append(" or ".join(alts))
+        record(f"{stage}: environment is set",
+               "FAIL" if missing else "PASS",
+               f"missing {', '.join(missing)} - {breaks}" if missing else "")
+
+    # CLOUDFLARE_EMAIL_WORKER naming a script that does not exist is worse
+    # than leaving it unset: the routing rule is created, reads "configured",
+    # and delivers to nothing. A typo is invisible without asking Cloudflare.
+    worker = os.environ.get("CLOUDFLARE_EMAIL_WORKER", "").strip()
+    token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+    account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    if not worker:
+        record("the named Email Worker exists", "SKIP",
+               "CLOUDFLARE_EMAIL_WORKER is not set")
+        return
+    if not (token and account):
+        record("the named Email Worker exists", "SKIP",
+               "no Cloudflare credential to ask with")
+        return
+    try:
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.cloudflare.com/client/v4/accounts/{account}"
+            f"/workers/scripts/{worker}",
+            headers={"Authorization": f"Bearer {token}"})
+        # The body is NOT parsed. This endpoint returns the script's own
+        # JAVASCRIPT SOURCE, not JSON, so an earlier version of this check
+        # called json.load on it, threw, and reported SKIP - "could not ask"
+        # - for a worker that plainly exists. A 200 is the whole answer.
+        with urllib.request.urlopen(req, timeout=30) as f:
+            status = getattr(f, "status", None) or f.getcode()
+        record(f"the Email Worker {worker!r} exists",
+               "PASS" if status == 200 else "SKIP",
+               "" if status == 200 else f"Cloudflare answered {status}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            record(f"the Email Worker {worker!r} exists", "FAIL",
+                   "Cloudflare has no such script, so every dev@ rule this "
+                   "pipeline writes points at nothing and mail is lost "
+                   "silently")
+        else:
+            # Could not ASK. Must not read as "the worker is fine".
+            record(f"the Email Worker {worker!r} exists", "SKIP",
+                   f"Cloudflare answered {e.code}; this check could not be "
+                   f"made, which is not the same as passing")
+    except Exception as e:                      # pragma: no cover - network
+        record(f"the Email Worker {worker!r} exists", "SKIP",
+               f"could not reach Cloudflare: {e}")
+
+
 def main() -> int:
     print("Deployment self-check - read-only, changes nothing")
     print(f"repo: {ROOT}")
@@ -510,6 +603,7 @@ def main() -> int:
     check_app_imports()
     check_source_readable()
     check_build_toolchain()
+    check_pipeline_env()
 
     failed = [n for n, s, _ in RESULTS if s == "FAIL"]
     skipped = [n for n, s, _ in RESULTS if s == "SKIP"]
