@@ -225,14 +225,52 @@ def _availability(available_names: set[str], premium: set[str] = frozenset()):
     return check_domains, calls
 
 
+# One price per TLD, ascending in CHEAP_TLDS order: .online cheapest,
+# .com dearest. That is exactly the ordering these tests assert on, so
+# stubbing changes no expectation - it only stops the suite asking
+# Namecheap.
+_STUB_PRICES = {tld: (1.0 + i, "USD") for i, tld in enumerate(nc.CHEAP_TLDS)}
+
+
+class _NoNetwork:
+    """Any HTTP call from inside _search is a bug in the stubbing."""
+
+    def __getattr__(self, name):
+        def _refuse(*a, **k):
+            raise AssertionError(
+                "test_auto_recovery reached the network (requests.%s). This "
+                "file is in the hermetic suite, which the Makefile defines as "
+                "running without a network or a provider account; stub the "
+                "call instead." % name)
+        return _refuse
+
+
 def _search(name: str, available: set[str], premium: set[str] = frozenset()):
-    saved = nc.check_domains
+    """Availability AND pricing stubbed, with the network fenced off.
+
+    This helper stubbed check_domains but not one_year_price, so every call
+    went on to ask api.namecheap.com for real prices. It passed for as long
+    as Namecheap answered and then failed with a 522 when Namecheap had an
+    outage - a third-party incident breaking a suite that is supposed to
+    need no provider account. The credentials in that request were empty,
+    which is how a hermetic run reveals itself: it was never meant to be
+    making the call at all.
+
+    _NoNetwork makes the next such gap fail with a sentence saying what is
+    wrong, instead of an HTTPError from a vendor.
+    """
+    saved = (nc.check_domains, getattr(nc, "one_year_price", None), nc.requests)
     try:
         stub, calls = _availability(available, premium)
         nc.check_domains = stub
+        nc.one_year_price = lambda tld: _STUB_PRICES.get(tld, (99.0, "USD"))
+        nc.requests = _NoNetwork()
         return nc.find_cheapest_domain(name), calls
     finally:
-        nc.check_domains = saved
+        nc.check_domains = saved[0]
+        if saved[1] is not None:
+            nc.one_year_price = saved[1]
+        nc.requests = saved[2]
 
 
 def check_variants_when_the_plain_name_is_taken(r: Results) -> None:

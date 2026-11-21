@@ -811,19 +811,46 @@ def generate_all(company: dict, apk_path: Path | None, aab_path: Path | None, ou
     cn = company.get("company_number", "")
     support_email = company.get("support_email")
 
-    # Reuse existing URL — avoid creating a duplicate policy on every run
     policy_url = None
     existing_manifest = out_dir / "manifest.json"
     if existing_manifest.exists():
         try:
             existing_data = json.loads(existing_manifest.read_text(encoding="utf-8"))
             policy_url = existing_data.get("privacy_policy_url") or None
-            if policy_url:
-                print(f"  [{cn}] Privacy policy URL (existing): {policy_url}")
         except Exception:
             pass
 
-    if not policy_url and support_email:
+    # An already-recorded URL does NOT skip the publisher.
+    #
+    # It used to: the old code reused any URL in manifest.json to avoid
+    # creating a second freeprivacypolicy.com account on every run. That was
+    # right for a third-party account and wrong for a page we serve
+    # ourselves, because it disables the safeguard the publisher exists for.
+    # If the app gains a network permission, publish_policy is meant to
+    # refuse - but it was never called, so the page went on saying the
+    # operating system will not let the app send data anywhere.
+    #
+    # privacy_site.policy_action keeps a URL we do not serve (re-publishing
+    # cannot fix somebody else's page) and re-publishes one we do.
+    _publish = bool(support_email)
+    if policy_url:
+        try:
+            import sys as _sys
+            from pathlib import Path as _Path
+            _repo = str(_Path(__file__).resolve().parents[2])
+            if _repo not in _sys.path:
+                _sys.path.insert(0, _repo)
+            import privacy_site as _ps
+            _action, _why = _ps.policy_action(policy_url, company.get("domain"))
+        except Exception:
+            _action, _why = "keep", "privacy_site could not be loaded"
+        if _action == "keep":
+            print(f"  [{cn}] Privacy policy URL (kept): {policy_url} — {_why}")
+            _publish = False
+        else:
+            print(f"  [{cn}] Re-checking the published privacy policy — {_why}")
+
+    if _publish and support_email:
         # Published on the company's OWN domain, not on freeprivacypolicy.com.
         #
         # That site is behind a bot challenge and answers 403 "Just a
@@ -863,6 +890,21 @@ def generate_all(company: dict, apk_path: Path | None, aab_path: Path | None, ou
             elif status == "refused":
                 print(f"  [{cn}] Privacy policy NOT published: "
                       f"{out.get('reason')}")
+                if policy_url:
+                    # A page is already up and the app no longer supports
+                    # what it says. Stop advertising it: shipping a link to
+                    # a policy that is no longer accurate is worse than
+                    # shipping none, and Play rejecting a missing URL is a
+                    # recoverable outcome where a misrepresentation is not.
+                    #
+                    # It is NOT deleted here. Taking a company's live legal
+                    # page down as a side effect of a routine build is too
+                    # much to do unasked, and a submission may be in flight.
+                    print(f"  [{cn}] !! {policy_url} is still live and is no "
+                          f"longer accurate. It is being dropped from this "
+                          f"app's manifest, and it must be corrected or "
+                          f"taken down by hand.")
+                    policy_url = None
             elif status == "not_delegated":
                 print(f"  [{cn}] Privacy policy not published yet: "
                       f"{out.get('message')}")

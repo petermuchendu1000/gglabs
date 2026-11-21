@@ -53,6 +53,34 @@ KV_NAMESPACE_TITLE = "pipeline-privacy-policies"
 POLICY_PATH = "/privacy"
 
 
+def policy_action(existing_url: str, domain: str) -> tuple[str, str]:
+    """Should the build publish again, or keep what is recorded?
+
+    Returns ("publish"|"keep", reason).
+
+    The build used to skip the publisher whenever manifest.json already held
+    a URL - correct for freeprivacypolicy.com, where every run created
+    another account and another agreement, and wrong for a page we serve
+    ourselves. Skipping it disables the safeguard this module exists for:
+    if the app gains a network permission, publish_policy is meant to
+    REFUSE, but it is never called, so the page goes on telling the world
+    the operating system will not let the app send data anywhere.
+
+    A URL we do not serve is left alone. Re-publishing cannot fix someone
+    else's page, and overwriting a hand-entered URL would lose it.
+    """
+    existing = (existing_url or "").strip()
+    ours = policy_url_for(domain)
+    if not existing:
+        return "publish", "no policy URL has been recorded for this company"
+    if ours and existing == ours:
+        return "publish", ("this policy is served from the company's own "
+                           "domain and publishing is idempotent, so the "
+                           "app's facts are re-checked on every build")
+    return "keep", ("%s is not a URL this pipeline serves, so it is left "
+                    "exactly as recorded" % existing)
+
+
 def policy_url_for(domain: str) -> str:
     domain = (domain or "").strip().lower().rstrip(".")
     return "https://%s%s" % (domain, POLICY_PATH) if domain else ""

@@ -264,6 +264,62 @@ def check_it_is_wired_against_the_same_source(r: Results) -> None:
             repr(decl["summary"]["needs_human"]))
 
 
+def check_an_existing_url_does_not_skip_the_recheck(r: Results) -> None:
+    """A recorded URL must not stop the facts being checked again.
+
+    Observed in a real run: "Privacy policy URL (existing): https://
+    simon-mwangi.site/privacy" - the build read the URL out of manifest.json
+    and never called the publisher at all.
+
+    That short-circuit was correct for freeprivacypolicy.com, where every
+    run created another account and another agreement. It is wrong for a
+    page we serve ourselves, and it quietly disables the one safeguard this
+    whole module was built around: if the app gains a network permission,
+    publish_policy is supposed to REFUSE - but it is never called, so the
+    page goes on saying the operating system will not let the app send data
+    anywhere, on the company's own domain, indefinitely.
+
+    A URL we do NOT serve is still left alone: re-publishing cannot fix
+    someone else's page, and overwriting a hand-entered URL would lose it.
+    """
+    print("\n-- a recorded URL still gets re-checked --")
+    ours = privacy_site.policy_url_for("simon-mwangi.site")
+
+    action, why = privacy_site.policy_action(ours, "simon-mwangi.site")
+    r.check("our own URL is re-published, not skipped", action == "publish",
+            f"the facts would never be checked again: {action} ({why})")
+    r.check("...and the reason says why re-running is safe",
+            "idempotent" in why, repr(why))
+
+    action, why = privacy_site.policy_action("", "simon-mwangi.site")
+    r.check("no URL yet means publish", action == "publish", repr(why))
+
+    for foreign in ("https://www.freeprivacypolicy.com/live/abc-123",
+                    "https://someone-else.example/policy"):
+        action, why = privacy_site.policy_action(foreign, "simon-mwangi.site")
+        r.check(f"a URL we do not serve is kept ({foreign[:34]})",
+                action == "keep",
+                "re-publishing cannot fix a page we do not host, and "
+                "overwriting a hand-entered URL would lose it")
+
+    # A URL on the right domain but a different path is not ours either.
+    action, _why = privacy_site.policy_action(
+        "https://simon-mwangi.site/legal/privacy", "simon-mwangi.site")
+    r.check("the same domain with a different path is not ours",
+            action == "keep", "we only serve /privacy")
+
+    # And the build must actually consult it.
+    src = open(os.path.join(REPO, "apps", "generator", "assets.py"),
+               encoding="utf-8").read()
+    r.check("the build asks policy_action instead of short-circuiting",
+            "policy_action(" in src,
+            "generate_all still skips the publisher whenever a URL exists")
+    r.check("...and stops advertising a URL whose page became false",
+            "no longer accurate" in src,
+            "a refused re-publish would leave the old URL in the manifest, "
+            "so the app would ship a link to a page that is now wrong")
+
+
 def check_the_pipeline_passes_what_the_policy_needs(r: Results) -> None:
     """The publisher reads fields the build pipeline has to hand it.
 
@@ -343,6 +399,7 @@ def main() -> int:
     check_dry_run_writes_nothing(r)
     check_worker_matches_the_facts(r)
     check_it_is_wired_against_the_same_source(r)
+    check_an_existing_url_does_not_skip_the_recheck(r)
     check_the_pipeline_passes_what_the_policy_needs(r)
     check_the_dashboard_shows_it(r)
     return r.report()
