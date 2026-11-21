@@ -639,6 +639,20 @@ def check_java_version_parsing(r: Results, deploy_check) -> None:
         r.check(f"looks_like_windows_path({value!r}) is {expect}",
                 deploy_check.looks_like_windows_path(value) is expect, why)
 
+    # buildToolsVersion must be read from the template and must be PINNED.
+    # Checking that some build-tools directory exists is what let the real
+    # failure through: 35.0.0 was installed, the check passed, and AGP asked
+    # for 34.0.0 - its own built-in default, unrelated to compileSdk - then
+    # tried to download it into a read-only SDK and died with a message
+    # about the directory not being writable.
+    bt = deploy_check.required_build_tools()
+    r.check("buildToolsVersion is pinned in the app template", bool(bt),
+            "unpinned, so AGP picks its own default and downloads it at "
+            "build time, which cannot work on a read-only SDK")
+    r.check("...and it is a real version string",
+            bool(bt) and re.match(r"^\d+\.\d+\.\d+$", bt),
+            f"got {bt!r}")
+
     # The floor comes from the template, not from this test.
     sdk = deploy_check.required_compile_sdk()
     r.check("compileSdk is read from the app template", sdk == 35,
@@ -713,10 +727,20 @@ def check_toolchain_guard_fires(r: Results, deploy_check) -> None:
         r.check("missing build-tools is reported FAILED",
                 any("build-tools" in f for f in fails), repr(fails))
 
-        # And the control: a complete-looking SDK clears both of those.
+        # The WRONG build-tools version must fail too. This is the one the
+        # old check missed: a directory existed, so it passed.
         sdk = deploy_check.required_compile_sdk()
+        want_bt = deploy_check.required_build_tools()
         (tmp / "platforms" / f"android-{sdk}").mkdir(parents=True)
-        (tmp / "build-tools" / "35.0.0").mkdir(parents=True)
+        (tmp / "build-tools" / "34.0.0").mkdir(parents=True)
+        fails = run({"ANDROID_HOME": str(tmp)})
+        r.check("the WRONG build-tools version is reported FAILED",
+                any("build-tools" in f for f in fails),
+                f"34.0.0 present, {want_bt} pinned, and the check passed - "
+                f"which is exactly how the real build failed: {fails!r}")
+
+        # And the control: the PINNED version clears it.
+        (tmp / "build-tools" / want_bt).mkdir(parents=True, exist_ok=True)
         fails = run({"ANDROID_HOME": str(tmp)})
         r.check("a complete SDK clears the platform check",
                 not any("android-" in f for f in fails), repr(fails))

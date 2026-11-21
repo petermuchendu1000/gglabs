@@ -7,6 +7,23 @@ plugins {
 android {
     namespace = "uk.company.utility"
     compileSdk = 35
+    // PINNED, and not optional on a server.
+    //
+    // Left unset, AGP 8.7.3 falls back to its own built-in default - which is
+    // 34.0.0, unrelated to compileSdk - and then tries to DOWNLOAD it at
+    // build time. On a machine where the SDK is read-only, as it should be,
+    // that fails with:
+    //
+    //   Failed to install the following SDK components:
+    //     build-tools;34.0.0
+    //   The SDK directory is not writable (/opt/android-sdk)
+    //
+    // which reads as a permissions problem and is really an unpinned
+    // version. Pinning it to the version actually installed means no
+    // download is attempted, the build is deterministic, and deploy_check
+    // can read this number and verify that exact directory exists instead of
+    // guessing from compileSdk. Change it only alongside the SDK install.
+    buildToolsVersion = "35.0.0"
 
     defaultConfig {
         applicationId = "uk.template.shift"

@@ -25,6 +25,10 @@ apps/template-shift-journal/app/build.gradle.kts
 # hand-written and stays tracked; only the c<number> flavor dirs are
 # generated.
 apps/template-shift-journal/app/src/c*/
+# Kotlin's incremental-compilation scratch directory, created by the Gradle
+# build next to the project. Same reason as build.gradle.kts above: without
+# this, every build leaves the working tree dirty.
+apps/template-shift-journal/.kotlin/
 pipeline_output/apps/*/signing.json
 pipeline_output/apps/*/*.jks
 

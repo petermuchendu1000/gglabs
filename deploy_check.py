@@ -413,6 +413,38 @@ def looks_like_windows_path(value: str) -> bool:
     return bool(re.match(r"^[A-Za-z]:[\\/]", v)) or "\\" in v
 
 
+def required_build_tools() -> str | None:
+    """buildToolsVersion from the app template, or None if it is not pinned.
+
+    Checking merely that SOME build-tools directory exists is what let this
+    through: 35.0.0 was installed, the check passed, and AGP asked for
+    34.0.0 - its own built-in default, unrelated to compileSdk - then tried
+    to download it into a read-only SDK and failed. The version the build
+    will actually use is the one written in the template, so that is the one
+    to look for. Unpinned is itself a finding.
+    """
+    text = _template_gradle()
+    if text is None:
+        return None
+    m = re.search(r'buildToolsVersion\s*=\s*"([^"]+)"', text)
+    return m.group(1) if m else None
+
+
+def _template_gradle() -> str | None:
+    """The app template's build file, preferring the generated one.
+
+    build.gradle.kts is regenerated from build.gradle.kts.template on every
+    build, so on a fresh checkout only the template exists.
+    """
+    base = os.path.join(ROOT, "apps", "template-shift-journal", "app")
+    for name in ("build.gradle.kts", "build.gradle.kts.template"):
+        try:
+            return open(os.path.join(base, name), encoding="utf-8").read()
+        except OSError:
+            continue
+    return None
+
+
 def required_compile_sdk() -> int | None:
     """compileSdk from the app template, so this check cannot go stale.
 
@@ -522,8 +554,21 @@ def check_build_toolchain() -> None:
 
     bt = os.path.join(sdk, "build-tools")
     versions = sorted(os.listdir(bt)) if os.path.isdir(bt) else []
-    record("build-tools is installed", "PASS" if versions else "FAIL",
-           ", ".join(versions) or bt)
+    want_bt = required_build_tools()
+    if not want_bt:
+        # Unpinned is the defect, not a detail. AGP then picks its own
+        # default and downloads it at build time, which fails on a read-only
+        # SDK with a message about the directory not being writable.
+        record("buildToolsVersion is pinned in the template", "FAIL",
+               "unpinned, so AGP will choose its own default (34.0.0 for "
+               "8.7.3) and try to download it into the SDK at build time; "
+               f"installed here: {', '.join(versions) or 'none'}")
+    else:
+        record(f"build-tools {want_bt} (the pinned version) is installed",
+               "PASS" if want_bt in versions else "FAIL",
+               "" if want_bt in versions else
+               f"installed: {', '.join(versions) or 'none'} - the build "
+               f"would try to download {want_bt} into the SDK")
 
     gradlew = os.path.join(ROOT, "apps", "template-shift-journal", "gradlew")
     if not os.path.exists(gradlew):
