@@ -388,6 +388,64 @@ def check_android_installer(r: Results) -> None:
     check_protecthome_caches(r, text)
     import deploy_check
     check_stage_env_table(r, deploy_check)
+    check_writable_by(r, deploy_check)
+
+
+def check_writable_by(r: Results, deploy_check) -> None:
+    """writable_by must answer for the SERVICE user, not for whoever asks.
+
+    Observed 2026-11-21: the dashboard failed with PermissionError on
+    colors.xml inside shutil.rmtree, while the identical stage run from a
+    root console got past that line and failed later at Gradle. Section 8
+    passed throughout, because it checks that source can be READ and the app
+    stage DELETES AND RECREATES app/src/<flavor> on every run.
+
+    os.access(W_OK) is useless here for the same reason it was useless for
+    reads: as root it is True for precisely the directories the service
+    cannot write.
+    """
+    print("\n-- writability, decided for the service user --")
+
+    class St:
+        def __init__(self, mode, uid, gid):
+            self.st_mode, self.st_uid, self.st_gid = mode, uid, gid
+
+    UID, GID, OTHER = 1000, 1000, 0
+    for mode, uid, gid, gids, expect, why in (
+        (0o755, OTHER, OTHER, {GID}, False,
+         "root-owned 755 - the state a root git pull and chmod 755 leaves"),
+        (0o775, OTHER, GID, {GID}, True, "group-writable and in the group"),
+        (0o755, UID, GID, {GID}, True, "owned by the service user"),
+        (0o555, UID, GID, {GID}, False, "owned but read-only"),
+        (0o777, OTHER, OTHER, {GID}, True, "world-writable"),
+        (0o770, OTHER, GID, set(), False, "group-writable, NOT in the group"),
+        (0o700, OTHER, OTHER, {GID}, False, "root-only"),
+    ):
+        got = deploy_check.writable_by(St(mode, uid, gid), UID, gids)
+        r.check(f"writable_by({oct(mode)}, uid={uid}, gid={gid}) is {expect}",
+                got is expect, why)
+
+    # Ownership must beat group and other, in that order - a directory owned
+    # by the user but mode 555 is NOT writable however open the other bits.
+    got = deploy_check.writable_by(St(0o577, UID, GID), UID, {GID})
+    r.check("owner bits win over group and other", got is False,
+            "0o577 owned by the user is not writable by that user, however "
+            "permissive the remaining bits look")
+
+    # The "deploy_check never calls os.access" assertion in
+    # check_permission_predicates parses the whole module and so already
+    # covers writable_by. It is not repeated here.
+
+    # The paths checked must be the ones the stage actually writes.
+    paths = {p for p, _why in deploy_check.WRITABLE_PATHS}
+    for needed in ("apps/template-shift-journal/app/src",
+                   "apps/generator/keystores", "pipeline_output"):
+        r.check(f"{needed} is on the writable list", needed in paths,
+                f"the stage writes here and nothing would notice: {paths!r}")
+    r.check("the service user is read from the unit, not hardcoded",
+            deploy_check.service_user() == "pipeline",
+            f"got {deploy_check.service_user()!r} - if the unit changes User= "
+            f"this check must follow it")
 
 
 def check_stage_env_table(r: Results, deploy_check) -> None:

@@ -630,6 +630,122 @@ def check_pipeline_env() -> None:
                f"could not reach Cloudflare: {e}")
 
 
+def service_user() -> str:
+    """The user the unit runs as, read from the unit rather than assumed."""
+    unit = os.path.join(ROOT, "deploy", "company-registration.service")
+    try:
+        text = open(unit, encoding="utf-8").read()
+    except OSError:
+        return ""
+    m = re.search(r"^User=(.+)$", text, re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def writable_by(st, uid: int, gids) -> bool:
+    """Could the user (uid, gids) write here? Decided from mode and ownership.
+
+    NOT os.access(W_OK). deploy_check normally runs as root, and root may
+    write almost anywhere regardless of mode, so an access-based answer is
+    True for exactly the directories the service cannot write. Same trap as
+    owner_only, and the reason that one exists.
+    """
+    if st.st_uid == uid:
+        return bool(st.st_mode & stat.S_IWUSR)
+    if st.st_gid in gids:
+        return bool(st.st_mode & stat.S_IWGRP)
+    return bool(st.st_mode & stat.S_IWOTH)
+
+
+# Directories the app stage writes into, and what it writes. Taken from the
+# code, not from memory: flavor_writer rmtree/recreates app/src/<flavor> and
+# rewrites app/build.gradle.kts, generate writes local.properties and copies
+# artifacts, keystore_mint creates keystores/ and .master_secret.
+WRITABLE_PATHS = (
+    ("pipeline_output", "stage output and app artifacts"),
+    ("apps/generator", ".master_secret, minted once and needed for every "
+                       "later signing"),
+    ("apps/generator/keystores", "the per-company upload keystore"),
+    ("apps/template-shift-journal", "local.properties and Gradle's project "
+                                    "cache"),
+    ("apps/template-shift-journal/app", "the generated build.gradle.kts and "
+                                        "build/ outputs"),
+    ("apps/template-shift-journal/app/src", "the per-company flavour overlay, "
+                                            "DELETED and recreated every run"),
+)
+
+
+def check_service_can_write() -> None:
+    """Readable is not writable, and the app stage writes a great deal.
+
+    Section 8 checks that the service can READ the source. That was the fault
+    it was written for and it does not cover this one: the app stage deletes
+    and recreates app/src/<flavor> on every run, so it needs WRITE access to
+    directories that a root-run `git pull` and a root-run `chmod 755` leave
+    owned by root. The failure surfaces as
+
+      PermissionError: [Errno 13] Permission denied: 'colors.xml'
+
+    from inside shutil.rmtree - a file name with no path and no hint that the
+    real subject is the containing directory's owner.
+
+    Running the same stage from a root console does not reproduce it, which
+    is what makes it expensive: root writes where the service cannot.
+    """
+    section("11. Directories the service must be able to write")
+    user = service_user()
+    if not user:
+        record("the service user is named in the unit", "FAIL",
+               "deploy/company-registration.service has no User= line, so "
+               "this check cannot name whose permissions matter")
+        return
+    try:
+        import grp
+        import pwd
+        pw = pwd.getpwnam(user)
+        gids = set(os.getgrouplist(user, pw.pw_gid))
+    except Exception as e:
+        # Could not ASK. Not the same as "the permissions are fine".
+        record(f"the service user {user!r} exists", "SKIP",
+               f"{e}; this check needs the account to resolve and cannot be "
+               f"made without it")
+        return
+    record(f"the service user {user!r} resolves", "PASS",
+           f"uid={pw.pw_uid} gids={sorted(gids)}")
+
+    for rel, what in WRITABLE_PATHS:
+        path = os.path.join(ROOT, rel)
+        if not os.path.exists(path):
+            # Absent is fine only if its PARENT can be written, since the
+            # stage creates it. Checking the parent is the real question.
+            parent = os.path.dirname(path)
+            try:
+                st = os.stat(parent)
+            except OSError as e:
+                record(f"{rel} can be created", "FAIL", f"{parent}: {e}")
+                continue
+            ok = writable_by(st, pw.pw_uid, gids)
+            record(f"{rel} can be created by {user}", "PASS" if ok else "FAIL",
+                   "" if ok else
+                   f"{parent} is {_owner(st)} mode "
+                   f"{oct(st.st_mode & 0o777)} - {what} cannot be created")
+            continue
+        st = os.stat(path)
+        ok = writable_by(st, pw.pw_uid, gids)
+        record(f"{rel} is writable by {user}", "PASS" if ok else "FAIL",
+               "" if ok else
+               f"{_owner(st)} mode {oct(st.st_mode & 0o777)} - {what}")
+
+
+def _owner(st) -> str:
+    try:
+        import grp
+        import pwd
+        return (f"owned by {pwd.getpwuid(st.st_uid).pw_name}:"
+                f"{grp.getgrgid(st.st_gid).gr_name}")
+    except Exception:
+        return f"owned by uid={st.st_uid} gid={st.st_gid}"
+
+
 def main() -> int:
     print("Deployment self-check - read-only, changes nothing")
     print(f"repo: {ROOT}")
@@ -644,6 +760,7 @@ def main() -> int:
     check_source_readable()
     check_build_toolchain()
     check_pipeline_env()
+    check_service_can_write()
 
     failed = [n for n, s, _ in RESULTS if s == "FAIL"]
     skipped = [n for n, s, _ in RESULTS if s == "SKIP"]
