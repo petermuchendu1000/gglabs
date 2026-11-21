@@ -1635,7 +1635,22 @@ function buildStageRow(s, d) {
   const done  = d.stages?.[s.key];
   const job   = d.jobs?.[s.key];
   const jobSt = job?.status;  // "running" | "done" | "failed" | undefined
-  const status = jobSt || (done ? "done" : "idle");
+
+  // A job record says what happened on the last run THROUGH THIS DASHBOARD.
+  // `done` is computed from what is actually on disk and in the row. The
+  // two can disagree, because a stage can also be completed from the
+  // console (e2e_run.py, pipeline.py), which runs the same code and leaves
+  // the in-memory job store untouched.
+  //
+  // This read `jobSt || done`, so a stale failure outranked observed
+  // reality: the app card showed "✗ Failed · 4h ago" beside "✓ Built",
+  // with the artifacts sitting on disk. Evidence wins. The failure is not
+  // hidden - the row says it happened and the Error Log button stays - but
+  // it is reported as history, not as the current state.
+  const staleFailure = done && jobSt === "failed";
+  const status = jobSt === "running" ? "running"
+               : done                ? "done"
+               : (jobSt || "idle");
 
   const rowCls = status === "running" ? " running" : status === "failed" ? " failed" : "";
 
@@ -1671,7 +1686,11 @@ function buildStageRow(s, d) {
       btns += `<button class="btn btn-sm btn-ghost" onclick="openEditModal('${FIELD_STAGE_FOCUS[s.key]}')" title="Set manually">✎ Set</button>`;
     }
     if (jobSt === "failed") {
-      btns += `<button class="btn btn-sm btn-danger" onclick="viewLog('${s.key}')">Error Log</button>`;
+      // Named differently when the stage has since completed, so nobody
+      // reads a historical failure as the thing blocking them now.
+      btns += staleFailure
+        ? `<button class="btn btn-sm btn-ghost" title="An earlier run through this dashboard failed; the stage has completed since" onclick="viewLog('${s.key}')">Earlier Error</button>`
+        : `<button class="btn btn-sm btn-danger" onclick="viewLog('${s.key}')">Error Log</button>`;
     } else if (jobSt === "done" || done) {
       btns += `<button class="btn btn-sm btn-ghost" onclick="viewLog('${s.key}')">Log</button>`;
     }

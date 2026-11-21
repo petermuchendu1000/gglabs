@@ -367,6 +367,94 @@ def _extract_js_function(src: str, name: str) -> str | None:
     return None
 
 
+def check_stale_failure_does_not_outrank_reality(r: Results) -> None:
+    """Observed artifacts beat a stale job record. Run in node.
+
+    The app card showed "✗ Failed · 4h ago" next to "✓ Built", with the
+    .apk and .aab sitting on disk. buildStageRow read
+
+        const status = jobSt || (done ? "done" : "idle");
+
+    so a job record always won. That record is what happened on the last run
+    THROUGH THE DASHBOARD, and _JOBS is an in-memory dict in the service
+    process - a stage completed from the console (e2e_run.py, pipeline.py)
+    runs the same code and cannot touch it, because it is a different
+    process. The console can therefore never correct a stale record, which
+    is exactly why the dashboard has to prefer what it can observe.
+
+    The failure is not hidden: the row still offers the log, under a name
+    that says it is historical.
+    """
+    print("\nstage row precedence (static/app.html, run in node)")
+    page = os.path.join(REPO, "static", "app.html")
+    with open(page, encoding="utf-8") as f:
+        src = f.read()
+
+    fn = _extract_js_function(src, "buildStageRow")
+    if not r.check("static/app.html defines buildStageRow(s, d)",
+                   fn is not None, "cannot reach the precedence rule"):
+        return
+    if not shutil_which("node"):
+        r.skip("stage row precedence", "node is not on PATH")
+        return
+
+    cases = [
+        # label,                 done,  jobStatus,  expect
+        ("built, stale failure", True,  "failed",  "done"),
+        ("not built, failed",    False, "failed",  "failed"),
+        ("built, job done",      True,  "done",    "done"),
+        ("built, no job",        True,  None,      "done"),
+        ("not built, no job",    False, None,      "idle"),
+        # running always wins: the artifacts on disk are from the PREVIOUS
+        # run while a new one is in flight.
+        ("built, running now",   True,  "running", "running"),
+    ]
+
+    with tempfile.TemporaryDirectory() as td:
+        driver = os.path.join(td, "row_test.mjs")
+        with open(driver, "w", encoding="utf-8") as f:
+            f.write("const x = s => String(s == null ? '' : s);\n"
+                    "const stageDetail = () => '';\n"
+                    "const fmtDuration = () => '';\n"
+                    "const fmtRelTime = () => '4h ago';\n")
+            f.write(fn + "\n")
+            f.write("const cases = " + json.dumps(cases) + ";\n")
+            f.write("""
+const out = [];
+for (const [label, done, jobStatus, expect] of cases) {
+  const d = { stages: { app: done }, jobs: {} };
+  if (jobStatus) d.jobs.app = { status: jobStatus, finished_at: "x" };
+  const html = buildStageRow({ key: "app", label: "Android App", icon: "A" }, d);
+  let got = "idle";
+  if (html.includes(">Running…<")) got = "running";
+  else if (html.includes(">Failed<")) got = "failed";
+  else if (html.includes(">Done<")) got = "done";
+  out.push([label, got, expect, html.includes("Earlier Error")]);
+}
+console.log(JSON.stringify(out));
+""")
+        proc = subprocess.run(["node", driver], capture_output=True, text=True,
+                              timeout=60)
+        if not r.check("the row renderer runs in node", proc.returncode == 0,
+                       (proc.stderr or "")[-500:]):
+            return
+        results = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    for label, got, expect, has_earlier in results:
+        r.check(f"{label}: shows {expect}", got == expect,
+                f"showed {got!r}; a stale record must not outrank what is "
+                f"on disk, and a real failure must still read as one")
+
+    by_label = {lbl: (got, earlier) for lbl, got, _e, earlier in results}
+    r.check("a stale failure still offers its log, named as historical",
+            by_label["built, stale failure"][1] is True,
+            "the earlier failure became unreachable - it is still the "
+            "record of what went wrong")
+    r.check("a real failure is NOT relabelled as historical",
+            by_label["not built, failed"][1] is False,
+            "a live failure was softened into an 'earlier' one")
+
+
 def check_drawer_text(r: Results) -> None:
     """Run the SHIPPED drawer function in node against real job shapes."""
     print("\nlog drawer text (static/app.html, run in node)")
@@ -845,6 +933,7 @@ def main() -> int:
     check_a_genuinely_missing_company_is_still_404(r)
     check_the_list_still_works(r)
     check_sidebar_message(r)
+    check_stale_failure_does_not_outrank_reality(r)
     check_drawer_text(r)
     return r.report()
 
