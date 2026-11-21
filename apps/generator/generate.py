@@ -238,6 +238,10 @@ def backup_and_make_assets(built: list[BuiltFlavor], collected: dict[str, dict[s
             "support_email": c.support_email,
             "application_id": c.application_id,
             "domain": c.domain,
+            # Needed by the privacy publisher, which prints the registered
+            # address on the policy page. Without it a pipeline run would
+            # overwrite a published policy with one missing that line.
+            "address": c.address,
             "role_noun": vocab["ROLE_NOUN"],
             "role_verb_start": vocab["ROLE_VERB_START"],
             "role_verb_end": vocab["ROLE_VERB_END"],

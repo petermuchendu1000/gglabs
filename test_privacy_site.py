@@ -264,6 +264,38 @@ def check_it_is_wired_against_the_same_source(r: Results) -> None:
             repr(decl["summary"]["needs_human"]))
 
 
+def check_the_pipeline_passes_what_the_policy_needs(r: Results) -> None:
+    """The publisher reads fields the build pipeline has to hand it.
+
+    generate.backup_and_make_assets builds the dict that reaches
+    assets.generate_all, which is where the policy is published. `address`
+    was not in that dict, so a pipeline run would have overwritten a live
+    policy with one missing the registered address - a silent downgrade of
+    a page already published.
+    """
+    print("\n-- the build passes every field the policy renders --")
+    src = open(os.path.join(REPO, "apps", "generator", "generate.py"),
+               encoding="utf-8").read()
+    block = src[src.index("assets.generate_all({"):]
+    block = block[:block.index("}")]
+    for field in ("company_name", "company_number", "support_email",
+                  "domain", "address"):
+        r.check(f"{field} is passed to generate_all", f'"{field}"' in block,
+                "the published policy loses it: " + repr(block[:200]))
+
+    # And the publisher must actually use them, or passing them proves
+    # nothing. Build a record and check each one lands.
+    rec = privacy_site.build_record(COMPANY, facts(), today="2026-11-21")
+    r.check("the record carries the registered address",
+            rec.get("registered_address") == COMPANY["address"], repr(rec))
+
+    # The Worker must render it rather than silently drop it.
+    js = open(os.path.join(REPO, "workers", "pipeline_privacy.js"),
+              encoding="utf-8").read()
+    r.check("the Worker renders the address when present",
+            "registered_address" in js, "it is carried but never shown")
+
+
 def check_the_dashboard_shows_it(r: Results) -> None:
     """The URL is the one field a human must paste into Google by hand.
 
@@ -311,6 +343,7 @@ def main() -> int:
     check_dry_run_writes_nothing(r)
     check_worker_matches_the_facts(r)
     check_it_is_wired_against_the_same_source(r)
+    check_the_pipeline_passes_what_the_policy_needs(r)
     check_the_dashboard_shows_it(r)
     return r.report()
 
