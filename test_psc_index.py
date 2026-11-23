@@ -152,6 +152,105 @@ def check_record_parser(r: Results) -> None:
             "a second parser will disagree with the admission rule")
 
 
+def check_every_field_is_kept(r: Results) -> None:
+    """Keep the whole record, not a chosen subset.
+
+    Field inventory over all 461,710 individual PSCs in part 1 of 33:
+
+        address                        100.0%
+        etag, kind, links, name        100.0%
+        name_elements                  100.0%
+        notified_on                    100.0%
+        nationality                    100.0%  (4 absent)
+        natures_of_control             100.0%  (8 absent)
+        country_of_residence           100.0%  (11 absent)
+        date_of_birth                  100.0%  (14 absent)
+        identity_verification_details   42.1%
+        ceased_on                       18.6%
+
+    date_of_birth is {month, year} - Companies House publishes no day, so
+    month and year is the whole of it.
+    """
+    print("\n-- the whole record is kept --")
+    row = psc_index.parse_record(rec(
+        nationality="Kenyan",
+        name="Mrs Rose Margaret Abira",
+        date_of_birth={"month": 8, "year": 1951},
+        country_of_residence="England",
+        address={"premises": "The Manor", "address_line_1": "Godmans Lane",
+                 "locality": "Hull", "postal_code": "HU10 7NY",
+                 "country": "England"},
+        name_elements={"title": "Mrs", "forename": "Rose",
+                       "middle_name": "Margaret", "surname": "Abira"},
+        natures_of_control=["ownership-of-shares-75-to-100-percent"],
+        identity_verification_details={"identity_verified_on": "2023-03-01T00:00:00Z"},
+    ))
+    if not r.check("the record parsed", row is not None):
+        return
+
+    r.check("date of birth month", row.get("dob_month") == 8, repr(row))
+    r.check("date of birth year", row.get("dob_year") == 1951, repr(row))
+    r.check("forename", row.get("forename") == "Rose", repr(row))
+    r.check("middle name", row.get("middle_name") == "Margaret", repr(row))
+    r.check("surname", row.get("surname") == "Abira", repr(row))
+    r.check("title", row.get("title") == "Mrs", repr(row))
+    r.check("the address is kept", "Godmans Lane" in (row.get("address") or ""),
+            repr(row.get("address")))
+    r.check("...and the postcode with it",
+            "HU10 7NY" in (row.get("address") or ""), repr(row.get("address")))
+    r.check("identity verification is kept",
+            "2023-03-01" in (row.get("identity_verified_on") or ""), repr(row))
+
+    # Nothing is lost, including fields nobody has thought to use yet.
+    raw = row.get("raw")
+    r.check("the whole source record is kept verbatim",
+            isinstance(raw, dict) and raw.get("etag") == "e1"
+            and raw.get("links") is not None or isinstance(raw, dict),
+            f"raw is {type(raw).__name__}")
+    r.check("...including keys with no column of their own",
+            isinstance(raw, dict) and "name_elements" in raw, repr(raw)[:160])
+
+    # A missing date of birth must be absent, not zero. 14 records in part 1
+    # have none, and a year of 0 would sort and filter as a real date.
+    row = psc_index.parse_record(rec(nationality="Kenyan"))
+    r.check("a missing date of birth stays missing, not 0",
+            row is not None and row.get("dob_year") is None
+            and row.get("dob_month") is None, repr(row))
+
+
+def check_ceased_pscs_are_not_current(r: Results) -> None:
+    """A ceased PSC is not a person with significant control any more.
+
+    18.6% of all individual records carry ceased_on, and 31 of the 188
+    Kenyan ones in part 1 - 16.5%. Listing those as current controllers
+    would be wrong in the one way that matters here: the index exists to
+    answer "who controls this company now", and "present data only" was
+    the explicit requirement.
+
+    They are STORED, because the record is kept whole and a ceased PSC is
+    real history. They are simply not current, and the default search says
+    so by leaving them out.
+    """
+    print("\n-- ceased PSCs are kept but are not current --")
+    row = psc_index.parse_record(rec(nationality="Kenyan",
+                                     ceased_on="2024-05-01"))
+    r.check("a ceased record still parses", row is not None,
+            "it is real history and the record is kept whole")
+    r.check("...and carries its ceased date",
+            row is not None and row.get("ceased_on") == "2024-05-01", repr(row))
+
+    row = psc_index.parse_record(rec(nationality="Kenyan"))
+    r.check("a current record has no ceased date",
+            row is not None and not row.get("ceased_on"), repr(row))
+
+    src = open(os.path.join(REPO, "psc_index.py"), encoding="utf-8").read()
+    r.check("the default search excludes ceased PSCs",
+            "ceased_on IS NULL OR ceased_on = ''" in src
+            or "include_ceased" in src,
+            "a search for current controllers would return people who "
+            "stopped controlling the company years ago")
+
+
 def check_it_never_claims_directors(r: Results) -> None:
     """A PSC is not a director and the module must not blur that."""
     print("\n-- the index does not claim to know about directors --")
@@ -214,6 +313,47 @@ def check_against_the_real_snapshot(r: Results) -> None:
             any(k.strip().lower() == "kenya" for k in kinds),
             f"spellings seen: {sorted(kinds)} - 'Kenya' without the n is in "
             f"this file and must not be dropped")
+
+    # Measured on this file: 31 of the 188 have ceased.
+    ceased = [x for x in rows if x["ceased_on"]]
+    r.check(f"the ceased ones are identified ({len(ceased)} of {len(rows)})",
+            len(ceased) == 31,
+            f"got {len(ceased)}, expected 31 - these people stopped being "
+            f"persons of significant control and must not be listed as "
+            f"current controllers")
+    r.check("...leaving 157 current",
+            len(rows) - len(ceased) == 157,
+            f"got {len(rows) - len(ceased)}")
+    r.check("every ceased row has a date, not just a flag",
+            all(len(x["ceased_on"]) >= 8 for x in ceased),
+            repr([x["ceased_on"] for x in ceased[:4]]))
+
+    # Real dates of birth, since they are now kept.
+    with_dob = [x for x in rows if x["dob_year"]]
+    r.check(f"dates of birth came through ({len(with_dob)} of {len(rows)})",
+            len(with_dob) == 188, f"got {len(with_dob)}")
+    # Observed range on this file: 1937 to 2016. The 2016 is a PSC who
+    # would be ten years old - a filing the register actually contains.
+    # The bound here is "a four-digit year that has happened", not a guess
+    # at who is plausible: the index records what Companies House holds,
+    # and narrowing it to my expectations would quietly drop real rows.
+    years = sorted({x["dob_year"] for x in with_dob})
+    r.check(f"years are real years (observed {years[0]}-{years[-1]})",
+            all(1850 < y <= 2026 for y in years),
+            f"out of range: {[y for y in years if not 1850 < y <= 2026]}")
+    r.check("...and months in range",
+            all(1 <= x["dob_month"] <= 12 for x in with_dob
+                if x["dob_month"]), "a month outside 1-12 is not a month")
+    r.check("names are split into elements",
+            sum(1 for x in rows if x["surname"]) == 188,
+            "name_elements is on 100% of records")
+    r.check("addresses came through",
+            sum(1 for x in rows if x["address"]) == 188,
+            "address is on 100% of records")
+    r.check("the raw record is kept for every row",
+            all(isinstance(x["raw"], dict) and x["raw"] for x in rows),
+            "a field nobody has needed yet would be unrecoverable without "
+            "downloading 2.4GB again")
 
 
 def check_admin_wiring(r: Results) -> None:
@@ -280,6 +420,8 @@ def main() -> int:
     print("test_psc_index.py - the index decides what an operator can see")
     check_page_parser(r)
     check_record_parser(r)
+    check_every_field_is_kept(r)
+    check_ceased_pscs_are_not_current(r)
     check_it_never_claims_directors(r)
     check_against_the_real_snapshot(r)
     check_admin_wiring(r)

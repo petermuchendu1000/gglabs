@@ -120,6 +120,9 @@ def parse_record(line: str, forms=None) -> dict | None:
     if not (set(forms) & set(directors.nationalities({"nationality": raw}))):
         return None
     noc = data.get("natures_of_control") or []
+    ne = data.get("name_elements") or {}
+    dob = data.get("date_of_birth") or {}
+    ivd = data.get("identity_verification_details") or {}
     return {
         "company_number": cn,
         "etag": str(data.get("etag") or ""),
@@ -128,7 +131,48 @@ def parse_record(line: str, forms=None) -> dict | None:
         "country_of_residence": str(data.get("country_of_residence") or "").strip(),
         "natures_of_control": "; ".join(str(n) for n in noc),
         "notified_on": str(data.get("notified_on") or ""),
+        # A ceased PSC is not a person with significant control any more.
+        # 18.6% of all individual records carry this, and 16.5% of the
+        # Kenyan ones. Kept, because the record is kept whole and this is
+        # real history, but it is what makes a row not current.
+        "ceased_on": str(data.get("ceased_on") or ""),
+        # Month and year only - Companies House publishes no day, so this
+        # is the whole of it. Left as None when absent (14 records in part
+        # 1 have none): a year of 0 would filter and sort as a real date.
+        "dob_month": _int_or_none(dob.get("month")),
+        "dob_year": _int_or_none(dob.get("year")),
+        "title": str(ne.get("title") or "").strip(),
+        "forename": str(ne.get("forename") or "").strip(),
+        "middle_name": str(ne.get("middle_name") or "").strip(),
+        "surname": str(ne.get("surname") or "").strip(),
+        "address": _format_address(data.get("address") or {}),
+        "identity_verified_on": str(ivd.get("identity_verified_on") or ""),
+        # The source record, verbatim. Columns exist for what is queried;
+        # this is so that a field nobody has needed yet - links, the rest
+        # of identity_verification_details, anything Companies House adds
+        # later - is not lost and cannot only be recovered by downloading
+        # 2.4GB again.
+        "raw": data,
     }
+
+
+def _int_or_none(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+# Observed across all 461,710 individual records in part 1, in the order
+# they make sense on an envelope.
+_ADDRESS_ORDER = ("care_of", "po_box", "premises", "address_line_1",
+                  "address_line_2", "locality", "region", "postal_code",
+                  "country")
+
+
+def _format_address(addr: dict) -> str:
+    return ", ".join(str(addr[k]).strip() for k in _ADDRESS_ORDER
+                     if str(addr.get(k) or "").strip())
 
 
 # ── Schema ─────────────────────────────────────────────────────────────────
@@ -152,10 +196,29 @@ def ensure_schema() -> None:
               updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
               PRIMARY KEY (company_number, etag)
             )""")
+        # Added after the table first shipped, so ADD COLUMN IF NOT EXISTS
+        # rather than relying on CREATE TABLE - which does nothing when the
+        # table is already there, leaving a live table missing every column
+        # named in a later SELECT. Same reconciliation db.ensure_schema
+        # does, for the same reason.
+        for col, coltype in (("ceased_on", "TEXT"),
+                             ("dob_month", "INTEGER"),
+                             ("dob_year", "INTEGER"),
+                             ("title", "TEXT"),
+                             ("forename", "TEXT"),
+                             ("middle_name", "TEXT"),
+                             ("surname", "TEXT"),
+                             ("address", "TEXT"),
+                             ("identity_verified_on", "TEXT"),
+                             ("raw", "JSONB")):
+            cur.execute(f"ALTER TABLE {TABLE} "
+                        f"ADD COLUMN IF NOT EXISTS {col} {coltype}")
         cur.execute(f"CREATE INDEX IF NOT EXISTS {TABLE}_nat_idx "
                     f"ON {TABLE} (nationality)")
         cur.execute(f"CREATE INDEX IF NOT EXISTS {TABLE}_snap_idx "
                     f"ON {TABLE} (snapshot_date)")
+        cur.execute(f"CREATE INDEX IF NOT EXISTS {TABLE}_ceased_idx "
+                    f"ON {TABLE} (ceased_on)")
 
 
 # ── Ingest ─────────────────────────────────────────────────────────────────
@@ -267,19 +330,35 @@ def _replace(date: str, rows: list[dict]) -> tuple[int, int]:
                 f"""INSERT INTO {TABLE}
                       (company_number, etag, psc_name, nationality,
                        country_of_residence, natures_of_control, notified_on,
-                       snapshot_date, updated_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now())
+                       ceased_on, dob_month, dob_year, title, forename,
+                       middle_name, surname, address, identity_verified_on,
+                       raw, snapshot_date, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                            %s::jsonb,%s, now())
                     ON CONFLICT (company_number, etag) DO UPDATE SET
                       psc_name = EXCLUDED.psc_name,
                       nationality = EXCLUDED.nationality,
                       country_of_residence = EXCLUDED.country_of_residence,
                       natures_of_control = EXCLUDED.natures_of_control,
                       notified_on = EXCLUDED.notified_on,
+                      ceased_on = EXCLUDED.ceased_on,
+                      dob_month = EXCLUDED.dob_month,
+                      dob_year = EXCLUDED.dob_year,
+                      title = EXCLUDED.title,
+                      forename = EXCLUDED.forename,
+                      middle_name = EXCLUDED.middle_name,
+                      surname = EXCLUDED.surname,
+                      address = EXCLUDED.address,
+                      identity_verified_on = EXCLUDED.identity_verified_on,
+                      raw = EXCLUDED.raw,
                       snapshot_date = EXCLUDED.snapshot_date,
                       updated_at = now()""",
                 (r["company_number"], r["etag"], r["psc_name"],
                  r["nationality"], r["country_of_residence"],
-                 r["natures_of_control"], r["notified_on"], date))
+                 r["natures_of_control"], r["notified_on"], r["ceased_on"],
+                 r["dob_month"], r["dob_year"], r["title"], r["forename"],
+                 r["middle_name"], r["surname"], r["address"],
+                 r["identity_verified_on"], json.dumps(r["raw"]), date))
         cur.execute(f"DELETE FROM {TABLE} WHERE snapshot_date <> %s", (date,))
         removed = cur.rowcount or 0
     return len(rows), removed
@@ -293,28 +372,61 @@ def status() -> dict:
     try:
         ensure_schema()
         with db._cursor() as cur:
-            cur.execute(f"SELECT count(*) AS n, count(DISTINCT company_number) "
-                        f"AS c, max(snapshot_date) AS d FROM {TABLE}")
+            # Current and ceased counted apart. One number covering both
+            # would overstate how many companies are actually controlled
+            # by a Kenyan person today by about a sixth.
+            cur.execute(f"""
+                SELECT count(*) AS n,
+                       count(DISTINCT company_number) AS c,
+                       max(snapshot_date) AS d,
+                       count(*) FILTER (
+                         WHERE ceased_on IS NOT NULL AND ceased_on <> ''
+                       ) AS ceased,
+                       count(DISTINCT company_number) FILTER (
+                         WHERE ceased_on IS NULL OR ceased_on = ''
+                       ) AS current_companies
+                FROM {TABLE}""")
             row = cur.fetchone() or {}
-        return {"rows": row.get("n") or 0, "companies": row.get("c") or 0,
-                "snapshot_date": row.get("d") or ""}
+        ceased = row.get("ceased") or 0
+        total = row.get("n") or 0
+        return {"rows": total, "companies": row.get("c") or 0,
+                "snapshot_date": row.get("d") or "",
+                "ceased": ceased, "current": total - ceased,
+                "current_companies": row.get("current_companies") or 0}
     except Exception as e:
         return {"error": str(e)}
 
 
-def search(q: str = "", limit: int = 50, offset: int = 0) -> list[dict]:
-    """Rows from the index. `q` matches a company number or a PSC name."""
+def search(q: str = "", limit: int = 50, offset: int = 0,
+           include_ceased: bool = False) -> list[dict]:
+    """Rows from the index. `q` matches a company number or a PSC name.
+
+    CEASED PSCs ARE EXCLUDED BY DEFAULT. 18.6% of all individual records
+    carry ceased_on, and 16.5% of the Kenyan ones: those people stopped
+    being persons of significant control, sometimes years ago. The index
+    answers "who controls this company now", so showing them as current
+    would be wrong in the only way that matters. They stay in the table -
+    the record is kept whole and this is real history - and
+    include_ceased brings them back when the history is the question.
+    """
     import db
     ensure_schema()
     sql = (f"SELECT company_number, psc_name, nationality, "
            f"country_of_residence, natures_of_control, notified_on, "
+           f"ceased_on, dob_month, dob_year, title, forename, middle_name, "
+           f"surname, address, identity_verified_on, "
            f"company_name, company_status, director_verdict, snapshot_date "
            f"FROM {TABLE}")
+    where: list[str] = []
     args: list = []
     q = (q or "").strip()
     if q:
-        sql += " WHERE company_number ILIKE %s OR psc_name ILIKE %s"
+        where.append("(company_number ILIKE %s OR psc_name ILIKE %s)")
         args += [f"%{q}%", f"%{q}%"]
+    if not include_ceased:
+        where.append("(ceased_on IS NULL OR ceased_on = '')")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY company_number LIMIT %s OFFSET %s"
     args += [max(1, min(int(limit), 500)), max(0, int(offset))]
     with db._cursor() as cur:

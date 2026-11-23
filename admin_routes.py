@@ -252,11 +252,16 @@ _PAGE = """<!doctype html>
     <button id="psc-refresh" onclick="pscRefresh()">Fetch latest snapshot</button>
     <input id="psc-q" placeholder="company number or PSC name"
            oninput="pscSearch()" style="margin-left:8px">
+    <label style="margin-left:8px;font-size:12px">
+      <input type="checkbox" id="psc-ceased" onchange="pscSearch()">
+      include ceased PSCs
+    </label>
   </div>
   <pre id="psc-log" style="display:none;max-height:160px;overflow:auto;
        font-size:11px;background:#111;padding:8px;border-radius:4px"></pre>
-  <table><thead><tr><th>Company</th><th>PSC</th><th>Nationality</th>
-    <th>Control</th><th>Director rule</th></tr></thead>
+  <table><thead><tr><th>Company</th><th>PSC</th><th>Born</th>
+    <th>Nationality</th><th>Residence</th><th>Control</th>
+    <th>Director rule</th></tr></thead>
     <tbody id="psc-rows"></tbody></table>
   <div id="psc-detail"></div>
 
@@ -370,9 +375,11 @@ async function pscStatus(){
   } else if (!ix.rows) {
     el.innerHTML = "Index is empty. Fetch a snapshot to build it.";
   } else {
-    el.innerHTML = `<b>${ix.rows}</b> Kenyan PSC records across `
-      + `<b>${ix.companies}</b> companies, from the snapshot of `
-      + `<b>${esc(ix.snapshot_date)}</b>.`;
+    el.innerHTML = `<b>${ix.current}</b> current Kenyan PSCs across `
+      + `<b>${ix.current_companies}</b> companies, from the snapshot of `
+      + `<b>${esc(ix.snapshot_date)}</b>. `
+      + `<span class="hint">${ix.ceased} further records are ceased and are `
+      + `kept but not counted as current.</span>`;
   }
   const logEl = document.getElementById("psc-log");
   const btn = document.getElementById("psc-refresh");
@@ -411,19 +418,25 @@ async function pscRefresh(){
 
 async function pscSearch(){
   const q = document.getElementById("psc-q").value.trim();
+  const inc = document.getElementById("psc-ceased").checked ? "&ceased=1" : "";
   let d;
-  try { d = await api("GET","/api/admin/psc/search?q="+encodeURIComponent(q)); }
+  try { d = await api("GET","/api/admin/psc/search?q="+encodeURIComponent(q)+inc); }
   catch(e){ return; }
   const rows = d.rows || [];
+  const born = r => r.dob_year
+    ? String(r.dob_month||"?").padStart(2,"0") + "/" + r.dob_year : "—";
   document.getElementById("psc-rows").innerHTML = rows.length
-    ? rows.map(r => `<tr style="cursor:pointer" onclick="pscOpen('${esc(r.company_number)}')">
+    ? rows.map(r => `<tr style="cursor:pointer${r.ceased_on ? ";opacity:.55" : ""}"
+          onclick="pscOpen('${esc(r.company_number)}')">
         <td>${esc(r.company_number)}${r.company_name ? "<br><small>"+esc(r.company_name)+"</small>" : ""}</td>
-        <td>${esc(r.psc_name)}</td>
+        <td>${esc(r.psc_name)}${r.ceased_on ? '<br><small style="color:#f88">ceased '+esc(r.ceased_on)+"</small>" : ""}</td>
+        <td><small>${born(r)}</small></td>
         <td>${esc(r.nationality)}</td>
+        <td><small>${esc(r.country_of_residence||"")}</small></td>
         <td><small>${esc(r.natures_of_control||"")}</small></td>
         <td><small>${r.director_verdict ? esc(r.director_verdict) : "not checked"}</small></td>
       </tr>`).join("")
-    : `<tr><td colspan="5" class="hint">No rows. ${q ? "Nothing matches that." : "Fetch a snapshot to build the index."}</td></tr>`;
+    : `<tr><td colspan="7" class="hint">No rows. ${q ? "Nothing matches that." : "Fetch a snapshot to build the index."}</td></tr>`;
 }
 
 async function pscOpen(cn){
@@ -448,13 +461,20 @@ async function pscOpen(cn){
       <br><small class="hint">From /company/${esc(cn)}/officers &mdash; the PSC
       rows below are a different fact and do not decide this.</small>
     </div>
-    <table><thead><tr><th>PSC</th><th>Nationality</th><th>Residence</th>
-      <th>Control</th><th>Notified</th></tr></thead><tbody>
-      ${(d.psc_rows||[]).map(p => `<tr>
-        <td>${esc(p.psc_name)}</td><td>${esc(p.nationality)}</td>
+    <table><thead><tr><th>PSC</th><th>Born</th><th>Nationality</th>
+      <th>Residence</th><th>Address</th><th>Control</th>
+      <th>Notified</th><th>Ceased</th><th>ID verified</th></tr></thead><tbody>
+      ${(d.psc_rows||[]).map(p => `<tr${p.ceased_on ? ' style="opacity:.55"' : ""}>
+        <td>${esc(p.psc_name)}${p.surname ? "<br><small>"+esc([p.title,p.forename,p.middle_name,p.surname].filter(Boolean).join(" "))+"</small>" : ""}</td>
+        <td><small>${p.dob_year ? esc(String(p.dob_month||"?").padStart(2,"0")+"/"+p.dob_year) : "—"}</small></td>
+        <td>${esc(p.nationality)}</td>
         <td>${esc(p.country_of_residence||"")}</td>
+        <td><small>${esc(p.address||"")}</small></td>
         <td><small>${esc(p.natures_of_control||"")}</small></td>
-        <td>${esc(p.notified_on||"")}</td></tr>`).join("")}
+        <td><small>${esc(p.notified_on||"")}</small></td>
+        <td><small${p.ceased_on ? ' style="color:#f88"' : ""}>${esc(p.ceased_on||"—")}</small></td>
+        <td><small>${esc((p.identity_verified_on||"").split("T")[0] || "—")}</small></td>
+      </tr>`).join("")}
     </tbody></table>`;
   pscSearch();
 }
@@ -533,10 +553,12 @@ def api_psc_refresh():
 @admin.route("/api/admin/psc/search")
 def api_psc_search():
     import psc_index
+    inc = request.args.get("ceased", "").strip() in ("1", "true", "yes")
     return jsonify({"rows": psc_index.search(
         q=request.args.get("q", ""),
         limit=request.args.get("limit", default=50, type=int),
-        offset=request.args.get("offset", default=0, type=int))})
+        offset=request.args.get("offset", default=0, type=int),
+        include_ceased=inc)})
 
 
 @admin.route("/api/admin/psc/company/<cn>")
