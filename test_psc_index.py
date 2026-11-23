@@ -356,6 +356,79 @@ def check_against_the_real_snapshot(r: Results) -> None:
             "downloading 2.4GB again")
 
 
+def check_against_a_real_database(r: Results) -> None:
+    """The write path, against PostgreSQL. Skips when none is configured.
+
+    Everything above tests parsing. The write is where "present data only"
+    actually happens, and it cannot be established by reading the SQL: the
+    batch insert, the jsonb adaptation and the delete-older-snapshots step
+    are all things the database decides. Run with DATABASE_URL pointing at
+    a THROWAWAY database - this truncates and rewrites psc_candidates.
+
+        DATABASE_URL=postgresql://postgres@127.0.0.1:5432/scratch \\
+            python3 test_psc_index.py
+    """
+    print("\n-- the write path, against a real PostgreSQL --")
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        r.skip("database write path", "DATABASE_URL is not set; this "
+                                      "rewrites psc_candidates so it needs a "
+                                      "throwaway database")
+        return
+    if not os.path.exists(REAL_PART):
+        r.skip("database write path", "the real snapshot part is not present")
+        return
+
+    import db
+    rows = list(psc_index.iter_part_records(REAL_PART))
+    written, _removed = psc_index._replace("2026-11-22", rows)
+    r.check("every parsed row was written", written == len(rows),
+            f"{written} of {len(rows)}")
+
+    st = psc_index.status()
+    r.check("status counts the rows", st["rows"] == 188, repr(st))
+    r.check("...and splits current from ceased",
+            st["ceased"] == 31 and st["current"] == 157, repr(st))
+
+    r.check("the default search hides ceased PSCs",
+            len(psc_index.search(limit=500)) == 157,
+            "a ceased controller would be offered as a current one")
+    r.check("...and include_ceased brings them back",
+            len(psc_index.search(limit=500, include_ceased=True)) == 188,
+            "the history became unreachable")
+
+    # raw must be real jsonb. A TEXT column holding JSON looks identical
+    # until somebody tries to query inside it.
+    with db._cursor() as cur:
+        cur.execute(f"SELECT pg_typeof(raw)::text AS t FROM {psc_index.TABLE} "
+                    f"LIMIT 1")
+        t = (cur.fetchone() or {}).get("t")
+        cur.execute(f"SELECT count(*) AS n FROM {psc_index.TABLE} "
+                    f"WHERE raw->>'kind' = %s", (psc_index.INDIVIDUAL,))
+        n = (cur.fetchone() or {}).get("n")
+    r.check("raw is stored as jsonb, not text", t == "jsonb", f"got {t!r}")
+    r.check("...and is queryable as JSON", n == 188,
+            f"raw->>'kind' matched {n} rows")
+
+    # The promise the whole design rests on: a newer snapshot REPLACES.
+    written, removed = psc_index._replace("2026-11-23", rows[:50])
+    st = psc_index.status()
+    r.check("a newer snapshot evicts the older rows", removed == 138,
+            f"removed {removed}; the table would hold two days at once")
+    r.check("...leaving only the present data",
+            st["rows"] == 50 and st["snapshot_date"] == "2026-11-23",
+            repr(st))
+
+    # And the delete must not fire when nothing was written - a failed
+    # download must never empty a working index.
+    before = psc_index.status()["rows"]
+    psc_index._replace("2026-11-23", [])
+    after = psc_index.status()["rows"]
+    r.check("re-writing the same snapshot with no rows keeps it",
+            after == before,
+            f"{before} -> {after}: an empty parse wiped the index")
+
+
 def check_admin_wiring(r: Results) -> None:
     """The dashboard half: routes exist, and the page's JS actually parses.
 
@@ -424,6 +497,7 @@ def main() -> int:
     check_ceased_pscs_are_not_current(r)
     check_it_never_claims_directors(r)
     check_against_the_real_snapshot(r)
+    check_against_a_real_database(r)
     check_admin_wiring(r)
     return r.report()
 

@@ -322,43 +322,37 @@ def _replace(date: str, rows: list[dict]) -> tuple[int, int]:
     The delete runs AFTER the insert so a failed download never empties a
     working index.
     """
+    import psycopg2.extras
+
     import db
     ensure_schema()
+    # One statement per BATCH, not per row. The database is Supabase, which
+    # is across a network: a few thousand sequential INSERTs is a few
+    # thousand round-trips, and the write would take longer than the 2.4GB
+    # download that produced the rows. execute_values sends them in pages.
+    cols = ("company_number", "etag", "psc_name", "nationality",
+            "country_of_residence", "natures_of_control", "notified_on",
+            "ceased_on", "dob_month", "dob_year", "title", "forename",
+            "middle_name", "surname", "address", "identity_verified_on",
+            "raw", "snapshot_date")
+    values = [
+        (r["company_number"], r["etag"], r["psc_name"], r["nationality"],
+         r["country_of_residence"], r["natures_of_control"], r["notified_on"],
+         r["ceased_on"], r["dob_month"], r["dob_year"], r["title"],
+         r["forename"], r["middle_name"], r["surname"], r["address"],
+         r["identity_verified_on"], psycopg2.extras.Json(r["raw"]), date)
+        for r in rows
+    ]
+    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols
+                        if c not in ("company_number", "etag"))
     with db._cursor() as cur:
-        for r in rows:
-            cur.execute(
-                f"""INSERT INTO {TABLE}
-                      (company_number, etag, psc_name, nationality,
-                       country_of_residence, natures_of_control, notified_on,
-                       ceased_on, dob_month, dob_year, title, forename,
-                       middle_name, surname, address, identity_verified_on,
-                       raw, snapshot_date, updated_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                            %s::jsonb,%s, now())
-                    ON CONFLICT (company_number, etag) DO UPDATE SET
-                      psc_name = EXCLUDED.psc_name,
-                      nationality = EXCLUDED.nationality,
-                      country_of_residence = EXCLUDED.country_of_residence,
-                      natures_of_control = EXCLUDED.natures_of_control,
-                      notified_on = EXCLUDED.notified_on,
-                      ceased_on = EXCLUDED.ceased_on,
-                      dob_month = EXCLUDED.dob_month,
-                      dob_year = EXCLUDED.dob_year,
-                      title = EXCLUDED.title,
-                      forename = EXCLUDED.forename,
-                      middle_name = EXCLUDED.middle_name,
-                      surname = EXCLUDED.surname,
-                      address = EXCLUDED.address,
-                      identity_verified_on = EXCLUDED.identity_verified_on,
-                      raw = EXCLUDED.raw,
-                      snapshot_date = EXCLUDED.snapshot_date,
-                      updated_at = now()""",
-                (r["company_number"], r["etag"], r["psc_name"],
-                 r["nationality"], r["country_of_residence"],
-                 r["natures_of_control"], r["notified_on"], r["ceased_on"],
-                 r["dob_month"], r["dob_year"], r["title"], r["forename"],
-                 r["middle_name"], r["surname"], r["address"],
-                 r["identity_verified_on"], json.dumps(r["raw"]), date))
+        if values:
+            psycopg2.extras.execute_values(
+                cur,
+                f"INSERT INTO {TABLE} ({', '.join(cols)}) VALUES %s "
+                f"ON CONFLICT (company_number, etag) DO UPDATE SET "
+                f"{updates}, updated_at = now()",
+                values, page_size=500)
         cur.execute(f"DELETE FROM {TABLE} WHERE snapshot_date <> %s", (date,))
         removed = cur.rowcount or 0
     return len(rows), removed
