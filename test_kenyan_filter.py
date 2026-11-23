@@ -84,6 +84,55 @@ KENYAN_PLUS_TWO_BLANK = [officer("Kenyan"), officer(None), officer(None)]
 
 
 # ── the nationality parser ──────────────────────────────────────────────
+def check_kenya_without_the_n(r: Results) -> None:
+    """'Kenya' is a real value in the register and did not match 'kenyan'.
+
+    Measured, not imagined. Part 1 of 33 of the Companies House PSC
+    snapshot of 2026-11-22 holds 461,710 individual records, every one with
+    a nationality. The Kenyan ones are spelled:
+
+        Kenyan           181
+        British,Kenyan     3
+        Kenyan,British     1
+        Finnish,Kenyan     1
+        English,Kenyan     1
+        Kenya              1      <-- no trailing n
+
+    The rule was `KENYAN in nationalities(o)`, an exact membership test
+    against the literal "kenyan", so that last one was silently not Kenyan.
+    One in 188 here, and the same spelling will occur in the officers data
+    the pipeline actually reads, because both come from the same free-text
+    field typed by the same filers.
+    """
+    print("\n-- 'Kenya' and 'Kenyan' are the same claim --")
+    import directors as D
+
+    for raw, want in (("Kenyan", True), ("Kenya", True),
+                      ("kenya", True), ("KENYA", True),
+                      ("British,Kenya", True), ("Kenya,British", True),
+                      ("British", False), ("Kenyatta", False),
+                      ("South African", False), (None, False)):
+        got = D.is_kenyan(officer(raw))
+        r.check(f"is_kenyan({raw!r}) is {want}", got is want,
+                f"got {got!r}")
+
+    # 'Kenyatta' is a surname, not a nationality: substring matching would
+    # admit it, which is why this is a membership test over split values
+    # and not `'kenya' in raw`.
+    r.check("matching is per value, not a substring scan",
+            not D.is_kenyan(officer("Kenyattan")),
+            "a value merely containing 'kenya' was treated as Kenyan")
+
+    # Both call sites must go through it, or the fix only lands in one.
+    api_src = open(os.path.join(REPO, "api_v2.py"), encoding="utf-8").read()
+    dir_src = open(os.path.join(REPO, "directors.py"), encoding="utf-8").read()
+    r.check("api_v2 uses the shared helper", "is_kenyan" in api_src,
+            "the console still has its own spelling of the rule")
+    r.check("directors.py uses it too",
+            dir_src.count("is_kenyan") >= 2,
+            "the pipeline half still has its own")
+
+
 def check_parser(r: Results) -> None:
     print("\n-- nationality is free text and must be split on commas only --")
     n = api_v2._nationalities
@@ -615,6 +664,7 @@ def check_breadth_reported(r: Results) -> None:
 def main() -> int:
     r = Results()
     print(f"target: the Kenyan-director admission rule in {REPO / 'api_v2.py'}")
+    check_kenya_without_the_n(r)
     check_parser(r)
     check_rule(r)
     check_fetch(r)

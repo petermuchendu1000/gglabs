@@ -15,6 +15,32 @@ from __future__ import annotations
 
 KENYAN = "kenyan"
 
+# Spellings of the same claim. Companies House stores nationality as free
+# text typed by the filer, so it is not a controlled vocabulary.
+#
+# MEASURED, not guessed. Part 1 of 33 of the PSC snapshot of 2026-11-22
+# holds 461,710 individual records, all with a nationality. The Kenyan ones
+# are spelled: Kenyan 181, British,Kenyan 3, Kenyan,British 1,
+# Finnish,Kenyan 1, English,Kenyan 1, and Kenya 1 - one in 188 without the
+# trailing n. An exact membership test against "kenyan" silently missed it,
+# and the officers data the pipeline reads comes from the same field typed
+# by the same filers.
+#
+# Still a membership test over comma-split values, never a substring scan:
+# 'Kenyatta' is a surname and must not read as a nationality.
+KENYAN_FORMS = frozenset({"kenyan", "kenya"})
+
+
+def is_kenyan(officer: dict) -> bool:
+    """Does this officer claim Kenyan nationality, however it is spelled?
+
+    One home for the rule. It was written out at two call sites - here and
+    in api_v2 - as `KENYAN in nationalities(o)`, which is exactly the kind
+    of duplication the module docstring above exists to prevent, and it
+    meant a fix had to be made twice or be half made.
+    """
+    return bool(KENYAN_FORMS & set(nationalities(officer)))
+
 
 def nationalities(officer: dict) -> list[str]:
     """An officer's nationalities, lowercased.
@@ -76,7 +102,7 @@ def pick_kenyan(officers: list[dict] | None) -> list[dict]:
     director from one request to the next, and the row would describe
     someone the ID stage never produces.
     """
-    kenyan = [o for o in officers or [] if KENYAN in nationalities(o)]
+    kenyan = [o for o in officers or [] if is_kenyan(o)]
     kenyan.sort(key=lambda o: (str(o.get("appointed_on") or "9999-99-99"),
                                str(o.get("name") or "")))
     return kenyan

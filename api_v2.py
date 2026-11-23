@@ -1200,7 +1200,7 @@ def _kenyan_verdict(items: list[dict]) -> tuple[bool, str]:
     actives = directors.active_directors(items)
     if not actives:
         return False, "no active directors on record"
-    kenyan = sum(1 for o in actives if _KENYAN in _nationalities(o))
+    kenyan = sum(1 for o in actives if directors.is_kenyan(o))
     if not kenyan:
         unknown = sum(1 for o in actives if not _nationalities(o))
         # Say when the answer rests on missing data, so an operator can tell
