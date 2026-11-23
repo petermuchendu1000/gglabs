@@ -791,6 +791,34 @@ def _owner(st) -> str:
         return f"owned by uid={st.st_uid} gid={st.st_gid}"
 
 
+# Binaries the Python code shells out to, found by grepping every
+# subprocess call outside the tests and the e2e harness: "git" (twice) and
+# "unzip" (once). Listed rather than discovered at runtime, so a new one
+# added without a check here is a deliberate omission rather than a
+# forgotten one.
+EXTERNAL_COMMANDS = (
+    ("unzip", "psc_index streams each snapshot part through `unzip -p`; "
+              "without it the index refresh fails per part, 33 times, part "
+              "way through a 2.4GB download"),
+    ("git", "deploy and version reporting"),
+    ("xvfb-run", "the DUNS and director_id stages drive a real browser"),
+)
+
+
+def check_external_commands() -> None:
+    """The binaries the Python code invokes by name.
+
+    A missing one surfaces as a FileNotFoundError naming a file that does
+    exist, from inside whatever long operation happened to need it. Cheaper
+    to ask here.
+    """
+    section("12. External commands")
+    for cmd, why in EXTERNAL_COMMANDS:
+        path = shutil.which(cmd)
+        record(f"{cmd} is on PATH", "PASS" if path else "FAIL",
+               path or why)
+
+
 def main() -> int:
     print("Deployment self-check - read-only, changes nothing")
     print(f"repo: {ROOT}")
@@ -806,6 +834,7 @@ def main() -> int:
     check_build_toolchain()
     check_pipeline_env()
     check_service_can_write()
+    check_external_commands()
 
     failed = [n for n, s, _ in RESULTS if s == "FAIL"]
     skipped = [n for n, s, _ in RESULTS if s == "SKIP"]

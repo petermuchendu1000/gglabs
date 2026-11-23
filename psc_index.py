@@ -51,6 +51,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import urllib.request
@@ -240,6 +241,13 @@ def iter_part_records(zip_path: str, forms=None):
     same, but unzip is already a dependency of the deploy and is faster
     here by enough to matter across 33 parts.
     """
+    if not shutil.which("unzip"):
+        # Raised here rather than let Popen throw a bare FileNotFoundError
+        # per part, 33 times, part way through a 2.4GB download, naming a
+        # file that does exist.
+        raise RuntimeError(
+            "unzip is not installed, and the snapshot parts are zip files. "
+            "apt-get install -y unzip")
     proc = subprocess.Popen(["unzip", "-p", zip_path], stdout=subprocess.PIPE)
     assert proc.stdout is not None
     try:
