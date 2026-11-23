@@ -159,6 +159,19 @@ def api_audit():
 
 
 # ── Page ────────────────────────────────────────────────────────────────────
+# This is JavaScript inside a NON-RAW Python string, so Python processes
+# backslash escapes before the browser sees a byte. Any escape meant for
+# JavaScript must be doubled: write \\n to send \n, \\u2014 to send —.
+#
+# Getting this wrong does not fail locally and does not fail loudly. A bare
+# \n becomes a real newline, which cuts the surrounding JS string literal in
+# half, which is a SyntaxError - and a SyntaxError discards the WHOLE script
+# block, so every function in it becomes undefined at once. It shipped once:
+# the PSC panel's status line sat on its placeholder and its button did
+# nothing, with nothing in any log to say why.
+#
+# test_admin_page_js.py checks the RENDERED page, which is the only place
+# the fault is visible.
 _PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -387,7 +400,7 @@ async function pscStatus(){
     btn.disabled = true;
     btn.textContent = "Fetching…";
     logEl.style.display = "block";
-    logEl.textContent = (job.log || []).join("\n");
+    logEl.textContent = (job.log || []).join("\\n");
     logEl.scrollTop = logEl.scrollHeight;
     if (!PSC_POLL) PSC_POLL = setInterval(pscStatus, 2000);
   } else {
@@ -396,7 +409,7 @@ async function pscStatus(){
     if (PSC_POLL) { clearInterval(PSC_POLL); PSC_POLL = null; }
     if (job.status === "failed") {
       logEl.style.display = "block";
-      logEl.textContent = (job.log || []).join("\n");
+      logEl.textContent = (job.log || []).join("\\n");
     }
     if (job.status === "done") pscSearch();
   }
@@ -405,7 +418,7 @@ async function pscStatus(){
 async function pscRefresh(){
   // Said plainly before it starts: this is a couple of gigabytes over the
   // server's connection and it REPLACES the table every search reads.
-  if (!confirm("Download today's PSC snapshot from Companies House?\n\n"
+  if (!confirm("Download today's PSC snapshot from Companies House?\\n\\n"
              + "33 parts, roughly 2.4GB, several minutes. The index is "
              + "replaced with the new snapshot when it finishes, so it "
              + "always shows the register as it stands today.")) return;

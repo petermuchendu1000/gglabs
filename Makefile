@@ -17,6 +17,7 @@ HERMETIC_TESTS := \
 	test_autofill.py \
 	test_auto_recovery.py \
 	test_add_candidates.py \
+	test_admin_page_js.py \
 	test_build_source.py \
 	test_check_stage.py \
 	test_cloudflare_dns.py \
