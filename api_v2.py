@@ -1602,8 +1602,12 @@ def v2_candidates():
     # the name is written back to the index, so this cost extinguishes.
     enrich = max(0, min(request.args.get("enrich", default=25, type=int), 50))
 
+    # ONE ROW PER COMPANY, not per PSC record. A company controlled by two
+    # Kenyan people is one thing to choose, and listing it twice gave two
+    # identical cards whose second click reports "already in pipeline" for
+    # something the operator has not done.
     try:
-        rows = psc_index.search(q=q, limit=limit, offset=offset)
+        rows = psc_index.search_companies(q=q, limit=limit, offset=offset)
     except Exception as e:
         return jsonify({"error": f"the PSC index could not be read: {e}",
                         "rows": []}), 200
@@ -1643,6 +1647,10 @@ def v2_candidates():
             "psc_name": r.get("psc_name") or "",
             "nationality": r.get("nationality") or "",
             "director_verdict": r.get("director_verdict") or "",
+            # How many Kenyan PSCs this company has. Carried rather than
+            # inferred from the joined name string, which would say one
+            # for two controllers who share a name.
+            "psc_count": int(r.get("psc_count") or 1),
             "in_pipeline": prow is not None,
             "n_done": 0,
             "total_stages": len(STAGE_ORDER),
@@ -1653,12 +1661,11 @@ def v2_candidates():
             entry["name"] = entry["name"] or str(prow.get("Company Name") or "")
         out.append(entry)
 
-    # The total matching the SAME query, so the dialog can say "25 of
-    # 6,759" rather than leaving an operator to guess whether a full page
-    # is the whole set. Counted separately from status(): status counts
-    # the index, this counts the search.
+    # The total matching the SAME query AND the same grouping. Pairing a
+    # company-grouped page with the record count would read "page 1 of
+    # 271" over a list that runs out at page 247.
     try:
-        total = psc_index.count(q=q)
+        total = psc_index.count_companies(q=q)
     except Exception:
         total = None
 

@@ -941,9 +941,24 @@
       display: inline-block; padding: 1px 8px;
       background: var(--surface2); border: 1px solid var(--border);
       border-radius: 999px; font-size: 11px; color: var(--text);
-      white-space: nowrap; max-width: 140px;
+      white-space: nowrap;
+      /* 140px was sized for a name alone. With the nationality in the
+         chip it truncated "Kenyan" to "K…" - the text was there, the
+         operator could not read it, and an innerText check said PRESENT.
+         The chips wrap, so a wider cap costs nothing. */
+      max-width: 260px;
       overflow: hidden; text-overflow: ellipsis;
     }
+
+    /* ── Director nationality, inside the chip ── */
+    .dir-nat {
+      margin-left: 6px; padding-left: 6px;
+      border-left: 1px solid var(--border);
+      color: var(--muted); font-size: 10px;
+    }
+    /* The admission rule is "at least one Kenyan director", so the one
+       that satisfies it is the one worth being able to find at a glance. */
+    .dir-nat-kenyan { color: var(--green); font-weight: 600; }
 
     /* ── SIC description ── */
     .sic-desc { font-size: 11px; color: var(--muted); margin-top: 2px; line-height: 1.35; }
@@ -1454,6 +1469,14 @@ function renderDetail() {
   const statusBadge = d.status ? `<span class="badge ${statusCls}">${x(d.status)}</span>` : "";
   const typeBadge   = d.type   ? `<span class="badge badge-gray">${x(d.type)}</span>` : "";
   const doneBadge   = `<span class="badge ${n_done===7?'badge-green':n_done>0?'badge-orange':'badge-gray'}">${n_done}/7</span>`;
+  // Stored by the add route, autofilled from Companies House, and until
+  // now shown nowhere - it is how two similarly-named companies are told
+  // apart. Conditional, because a company added before the autofill
+  // existed has no date and "Reg." followed by nothing is worse than
+  // no badge.
+  const regBadge = d.date_of_creation
+    ? `<span class="badge badge-gray" title="Date of registration">Reg. ${x(d.date_of_creation)}</span>`
+    : "";
   const running     = hasRunningJobs();
 
   const stageHtml = STAGES.map(s => buildStageRow(s, d)).join("");
@@ -1471,7 +1494,7 @@ function renderDetail() {
         <div class="detail-title">${x(d.name) || "Unnamed Company"}</div>
         <div class="detail-meta">
           <span class="badge badge-blue" style="font-family:monospace">${d.cn}</span>
-          ${statusBadge}${typeBadge}${doneBadge}
+          ${statusBadge}${typeBadge}${regBadge}${doneBadge}
         </div>
       </div>
       <div class="detail-actions">
@@ -1484,7 +1507,7 @@ function renderDetail() {
     </div>
 
     <div class="info-grid">
-      ${icDirectors(d.directors)}
+      ${icDirectors(d.directors, d.nationalities)}
       ${icAddress(d.address)}
       ${icSic(d.sic)}
       ${icDuns(d.duns)}
@@ -1781,14 +1804,38 @@ function ic(label, val, cls = "") {
   </div>`;
 }
 
-function icDirectors(val) {
+function icDirectors(val, nats) {
+  // The nationality is shown beside the name because it is the whole
+  // admission rule: "at least one Kenyan director". It was stored and
+  // sent but rendered nowhere, so the one fact justifying a billed
+  // domain order in this company's name was visible only inside Edit
+  // fields.
+  //
+  // Directors and Director Nationalities are parallel ';'-joined lists,
+  // so they are paired BY INDEX. Showing the whole nationalities string
+  // against every chip would attribute a nationality to the wrong
+  // person on any company with more than one director.
   const empty = !val || val === "None";
+  const names = empty ? []
+    : val.split(";").map(n => n.trim()).filter(Boolean);
+  const natList = String(nats == null || nats === "None" ? "" : nats)
+    .split(";").map(s => s.trim());
+  const chips = names.map((n, i) => {
+    const nat = natList[i] || "";
+    const kenyan = /kenya/i.test(nat);
+    // No nationality recorded for this director renders nothing at all,
+    // which is the normal case for a hand-entered row with two names
+    // and one nationality.
+    const natHtml = nat
+      ? `<span class="dir-nat${kenyan ? " dir-nat-kenyan" : ""}">${x(nat)}</span>`
+      : "";
+    return `<span class="dir-chip" title="${x(n)}${nat ? " · " + x(nat) : ""}">${x(n)}${natHtml}</span>`;
+  }).join("");
   return `<div class="info-card">
     <div class="info-label">Directors</div>
     ${empty
       ? `<div class="info-value empty">— <a class="ic-action" onclick="runStage('details')">Run Details →</a></div>`
-      : `<div class="dir-chips">${val.split(";").map(n => n.trim()).filter(Boolean)
-           .map(n => `<span class="dir-chip" title="${x(n)}">${x(n)}</span>`).join("")}</div>`
+      : `<div class="dir-chips">${chips}</div>`
     }
   </div>`;
 }
@@ -2742,6 +2789,7 @@ async function loadCandidates(q, keepPage) {
         <div class="sri-name">${x(name)}</div>
         <div class="sri-sub">${x(r.cn)}
           ${r.psc_name ? " &middot; PSC " + x(r.psc_name) : ""}
+          ${r.psc_count > 1 ? ` &middot; <b>${r.psc_count} Kenyan PSCs</b>` : ""}
           ${r.nationality ? " &middot; " + x(r.nationality) : ""}
           ${r.company_status && r.company_status !== "active"
             ? ' &middot; <span style="color:var(--orange)">' + x(r.company_status) + "</span>" : ""}

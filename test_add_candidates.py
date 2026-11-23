@@ -59,9 +59,10 @@ INDEX_ROWS = [
     {"company_number": "00000001", "psc_name": "Mr A Kariuki",
      "nationality": "Kenyan", "company_name": "", "company_status": "",
      "director_verdict": ""},
-    {"company_number": "00000002", "psc_name": "Ms B Wanjiru",
+    {"company_number": "00000002", "psc_name": "Ms B Wanjiru; Mr C Otieno",
      "nationality": "British,Kenyan", "company_name": "PARTWAY LTD",
-     "company_status": "active", "director_verdict": "admissible"},
+     "company_status": "active", "director_verdict": "admissible",
+     "psc_count": 2},
     {"company_number": "16811331", "psc_name": "Mr Simon Mwangi",
      "nationality": "Kenyan", "company_name": "SIMON MWANGI LTD",
      "company_status": "active", "director_verdict": "admissible"},
@@ -82,15 +83,19 @@ STAGES = {
 def call(url: str, index_rows=None, profiles=None):
     """Run the route with the index, pipeline and Companies House stubbed."""
     import psc_index
-    saved = (psc_index.search, psc_index.status, psc_index.record_company_facts,
+    saved = (psc_index.search_companies, psc_index.count_companies,
+             psc_index.status, psc_index.record_company_facts,
              api_v2._all_rows, api_v2._compute_stages, api_v2._profile_name)
     written: dict = {}
     rows = [dict(r) for r in (index_rows if index_rows is not None
                               else INDEX_ROWS)]
-    psc_index.search = lambda q="", limit=25, offset=0, include_ceased=False: [
-        r for r in rows
-        if not q or q.lower() in r["company_number"].lower()
-        or q.lower() in (r["psc_name"] or "").lower()]
+    psc_index.search_companies = (
+        lambda q="", limit=25, offset=0, include_ceased=False: [
+            r for r in rows
+            if not q or q.lower() in r["company_number"].lower()
+            or q.lower() in (r["psc_name"] or "").lower()])
+    psc_index.count_companies = (
+        lambda q="", include_ceased=False: len(rows))
     psc_index.status = lambda: {"rows": len(rows), "companies": len(rows),
                                 "current": len(rows),
                                 "current_companies": len(rows),
@@ -107,7 +112,8 @@ def call(url: str, index_rows=None, profiles=None):
         body = resp[0] if isinstance(resp, tuple) else resp
         return body.get_json(), written
     finally:
-        (psc_index.search, psc_index.status, psc_index.record_company_facts,
+        (psc_index.search_companies, psc_index.count_companies,
+         psc_index.status, psc_index.record_company_facts,
          api_v2._all_rows, api_v2._compute_stages,
          api_v2._profile_name) = saved
 
@@ -255,6 +261,46 @@ def check_the_dialog_opens_with_the_list(r: Results) -> None:
             "one")
 
 
+def check_one_card_per_company(r: Results) -> None:
+    """A company with two Kenyan PSCs is one choice, not two.
+
+    The list came from psc_index.search(), which returns PSC RECORDS. A
+    company controlled by two Kenyan people therefore appeared twice,
+    both cards clickable, both leading to the same row - and the second
+    click reads as a failure ("already in pipeline") for something the
+    operator has not done yet. Measured on the real snapshot: 6,486
+    current records across 6,152 companies.
+    """
+    print("\n-- one card per company, with its PSCs together --")
+    page = open(os.path.join(REPO, "static", "app.html"),
+                encoding="utf-8").read()
+    live = "\n".join(l for l in page.splitlines()
+                     if not l.strip().startswith("//"))
+    r.check("the card can say a company has several PSCs",
+            "psc_count" in live,
+            "two Kenyan controllers collapse into one card with no sign "
+            "the second exists")
+    r.check("...and only says it when there is more than one",
+            "psc_count > 1" in live or "psc_count>1" in live,
+            "every single-PSC company would read '1 Kenyan PSC', which is "
+            "noise on 5,800 of 6,152 rows")
+
+    # BEHAVIOUR, not just the presence of the word. Hardcoding
+    # "psc_count": 1 in the route satisfied every source check above and
+    # survived a mutation run: the dialog would simply never report a
+    # second controller, which is the whole point of the change.
+    data, _ = call("/api/v2/company/candidates?enrich=0")
+    rows = {x["cn"]: x for x in (data or {}).get("rows", [])}
+    r.check("the route passes the index's own PSC count through",
+            rows.get("00000002", {}).get("psc_count") == 2,
+            f"got {rows.get('00000002', {}).get('psc_count')!r} for a "
+            f"company the index says has 2 - a hardcoded 1 here is "
+            f"invisible in the markup and silent on screen")
+    r.check("...and defaults to 1 when the index does not say",
+            rows.get("00000001", {}).get("psc_count") == 1,
+            f"got {rows.get('00000001', {}).get('psc_count')!r}")
+
+
 def main() -> int:
     r = Results()
     print("test_add_candidates.py - what the Add dialog offers")
@@ -263,6 +309,7 @@ def main() -> int:
     check_empty_index_is_distinguishable(r)
     check_listing_does_not_admit(r)
     check_the_dialog_opens_with_the_list(r)
+    check_one_card_per_company(r)
     return r.report()
 
 

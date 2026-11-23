@@ -475,6 +475,66 @@ def search(q: str = "", limit: int = 50, offset: int = 0,
         return [dict(r) for r in cur.fetchall()]
 
 
+def count_companies(q: str = "", include_ceased: bool = False) -> int:
+    """How many COMPANIES match, as against how many PSC records.
+
+    Paired with search_companies the way count() is paired with search().
+    Pairing a company-grouped page with the record count is the same
+    drift one level up: "page 1 of 271" over a list that runs out at
+    page 247.
+    """
+    import db
+    ensure_schema()
+    clause, args = _where(q, include_ceased)
+    with db._cursor() as cur:
+        cur.execute(f"SELECT count(DISTINCT company_number) AS n "
+                    f"FROM {TABLE}{clause}", args)
+        row = cur.fetchone() or {}
+    return int(row.get("n") or 0)
+
+
+def search_companies(q: str = "", limit: int = 50, offset: int = 0,
+                     include_ceased: bool = False) -> list[dict]:
+    """One row per COMPANY, with its matching PSCs gathered together.
+
+    search() answers "which PSC records match", which is what the admin
+    panel wants: it is a viewer for the register and its rows ARE people.
+    The Add dialog is choosing a COMPANY, and a company controlled by two
+    Kenyan people is one choice, not two. Listing it twice gave an
+    operator two identical clickable cards, the second of which reports
+    "already in pipeline" for something they had not done yet. Measured
+    on the snapshot of 2026-11-22: 6,486 current records across 6,152
+    companies, so roughly 334 companies were listed more than once.
+
+    psc_count is returned rather than inferred from the joined name
+    string, because a company can have two PSCs who share a name and the
+    string would then say one.
+
+    The aggregates use the same WHERE as search() and count_companies(),
+    so a ceased PSC is excluded from the company's count as well as from
+    the list - a company whose only Kenyan PSC has ceased does not
+    appear at all.
+    """
+    import db
+    ensure_schema()
+    clause, args = _where(q, include_ceased)
+    args = list(args) + [max(1, min(int(limit), 500)), max(0, int(offset))]
+    with db._cursor() as cur:
+        cur.execute(
+            f"SELECT company_number, "
+            f"       max(company_name)     AS company_name, "
+            f"       max(company_status)   AS company_status, "
+            f"       max(director_verdict) AS director_verdict, "
+            f"       max(snapshot_date)    AS snapshot_date, "
+            f"       string_agg(DISTINCT psc_name, '; ')     AS psc_name, "
+            f"       string_agg(DISTINCT nationality, ', ')  AS nationality, "
+            f"       count(*) AS psc_count "
+            f"FROM {TABLE}{clause} "
+            f"GROUP BY company_number "
+            f"ORDER BY company_number LIMIT %s OFFSET %s", args)
+        return [dict(r) for r in cur.fetchall()]
+
+
 def record_company_facts(cn: str, company_name: str = "",
                          company_status: str = "",
                          director_verdict: str = "") -> None:

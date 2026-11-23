@@ -22,6 +22,7 @@ HERMETIC_TESTS := \
 	test_check_stage.py \
 	test_cloudflare_dns.py \
 	test_delegation.py \
+	test_detail_fields.py \
 	test_delegate_stage.py \
 	test_deploy_scripts.py \
 	test_e2e_run.py \

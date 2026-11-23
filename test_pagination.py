@@ -132,13 +132,16 @@ def check_candidates_route_reports_the_total(r: Results) -> None:
     print("\n-- the Add dialog's route does the same --")
     import api_v2
     app = flask.Flask(__name__)
-    saved = (psc_index.search, psc_index.count, psc_index.status,
-             api_v2._all_rows, api_v2._compute_stages, api_v2._profile_name)
-    psc_index.search = lambda q="", limit=25, offset=0, include_ceased=False: [
-        {"company_number": f"{i:08d}", "psc_name": "X", "nationality":
-         "Kenyan", "company_name": "N LTD", "company_status": "active",
-         "director_verdict": ""} for i in range(offset, offset + limit)]
-    psc_index.count = lambda q="", include_ceased=False: 6759
+    saved = (psc_index.search_companies, psc_index.count_companies,
+             psc_index.status, api_v2._all_rows, api_v2._compute_stages,
+             api_v2._profile_name)
+    psc_index.search_companies = (
+        lambda q="", limit=25, offset=0, include_ceased=False: [
+            {"company_number": f"{i:08d}", "psc_name": "X", "nationality":
+             "Kenyan", "company_name": "N LTD", "company_status": "active",
+             "director_verdict": "", "psc_count": 1}
+            for i in range(offset, offset + limit)])
+    psc_index.count_companies = lambda q="", include_ceased=False: 6759
     psc_index.status = lambda: {"rows": 7416, "companies": 6759,
                                 "current": 6486, "current_companies": 6152,
                                 "ceased": 930, "snapshot_date": "2026-11-22"}
@@ -155,8 +158,8 @@ def check_candidates_route_reports_the_total(r: Results) -> None:
         r.check("...and echoes limit and offset",
                 d.get("limit") == 25 and d.get("offset") == 25, repr(d)[:220])
     finally:
-        (psc_index.search, psc_index.count, psc_index.status,
-         api_v2._all_rows, api_v2._compute_stages,
+        (psc_index.search_companies, psc_index.count_companies,
+         psc_index.status, api_v2._all_rows, api_v2._compute_stages,
          api_v2._profile_name) = saved
 
 
@@ -304,6 +307,150 @@ def check_against_postgres(r: Results) -> None:
         cur.execute(f"DELETE FROM {psc_index.TABLE}")
 
 
+# ── one row per COMPANY, not per PSC record ─────────────────────────────────
+def check_company_grouping_pairs_too(r: Results) -> None:
+    """The Add dialog pages by COMPANY. Its count must do the same.
+
+    search() answers "which PSC records match" and that is right for the
+    admin panel, which is a PSC viewer. The Add dialog is choosing a
+    COMPANY, and a company with two Kenyan PSCs is one choice, not two.
+
+    Pairing search_companies with count() instead of count_companies()
+    would be the same drift as before, one level up: "page 1 of 271" over
+    a list that runs out at page 247, because the total counted records
+    and the pages counted companies.
+    """
+    print("\n-- the company-grouped view has its own matching count --")
+    src = open(os.path.join(REPO, "psc_index.py"), encoding="utf-8").read()
+    if not r.check("there is a search_companies()", "def search_companies(" in src,
+                   "the dialog would keep listing one card per PSC record"):
+        return
+    if not r.check("there is a count_companies()", "def count_companies(" in src,
+                   "no honest total for a company-grouped page"):
+        return
+
+    def body(name):
+        i = src.index(f"def {name}(")
+        j = src.index("\ndef ", i + 1)
+        return "\n".join(l for l in src[i:j].splitlines()
+                          if not l.strip().startswith("#"))
+
+    sc, cc = body("search_companies"), body("count_companies")
+    r.check("search_companies groups by company_number",
+            "GROUP BY company_number" in sc, sc[:300])
+    r.check("count_companies counts DISTINCT company_number",
+            "count(DISTINCT company_number)" in cc, cc[:300])
+    r.check("both reuse the shared predicate",
+            "_where(" in sc and "_where(" in cc,
+            "a third and fourth copy of the ceased/query filter")
+    r.check("the grouped page still pages",
+            "LIMIT" in sc and "OFFSET" in sc,
+            "grouping without paging loads 6,152 companies into the dialog")
+    r.check("it reports how many PSCs each company has",
+            "psc_count" in sc,
+            "collapsing two rows into one silently loses the fact that two "
+            "Kenyan people control the company")
+
+
+def check_candidates_route_pages_by_company(r: Results) -> None:
+    print("\n-- the Add route uses the company-grouped pair --")
+    src = open(os.path.join(REPO, "api_v2.py"), encoding="utf-8").read()
+    fn = src[src.index("def v2_candidates"):src.index("def v2_add_company")]
+    live_src = "\n".join(l for l in fn.splitlines()
+                          if not l.strip().lstrip("#").strip() == l.strip()
+                          or not l.strip().startswith("#"))
+    r.check("it calls search_companies", "search_companies(" in live_src, fn[:400])
+    r.check("...and count_companies", "count_companies(" in live_src, fn[:400])
+    r.check("it does NOT pair the grouped page with the record count",
+            "psc_index.count(q=" not in live_src,
+            "total would count PSC records while the pages count companies, "
+            "so the last pages would be empty")
+    r.check("psc_count reaches the dialog", "psc_count" in live_src,
+            "the card cannot say '2 Kenyan PSCs' without it")
+
+
+def check_grouping_against_postgres(r: Results) -> None:
+    print("\n-- grouping, against a real table --")
+    if not os.environ.get("DATABASE_URL", "").strip():
+        r.skip("company grouping against PostgreSQL", "DATABASE_URL is not set")
+        return
+    import db
+    psc_index.ensure_schema()
+    with db._cursor() as cur:
+        cur.execute(f"DELETE FROM {psc_index.TABLE}")
+
+    def row(cn, etag, name, nat="Kenyan", ceased=None):
+        return {"company_number": cn, "etag": etag, "psc_name": name,
+                "nationality": nat, "country_of_residence": "Kenya",
+                "natures_of_control": "ownership", "notified_on": "2024-01-01",
+                "ceased_on": ceased, "dob_month": 4, "dob_year": 1980,
+                "title": "Mr", "forename": "A", "middle_name": "",
+                "surname": "S", "address": "1 Road",
+                "identity_verified_on": None, "raw": {}}
+
+    # 00000001 has THREE Kenyan PSCs, 00000002 has one, 00000003 has one
+    # ceased only, 00000004 has one current and one ceased.
+    psc_index._replace("2026-11-22", [
+        row("00000001", "a", "Ann K"), row("00000001", "b", "Ben K"),
+        row("00000001", "c", "Cal K"),
+        row("00000002", "d", "Dee K"),
+        row("00000003", "e", "Eve K", ceased="2025-01-01"),
+        row("00000004", "f", "Fay K"),
+        row("00000004", "g", "Gus K", ceased="2025-01-01"),
+    ])
+
+    rows = psc_index.search_companies(limit=50)
+    cns = [x["company_number"] for x in rows]
+    r.check("one row per company, not per record",
+            cns == ["00000001", "00000002", "00000004"],
+            f"got {cns} - 7 records across 4 companies, of which 3 have a "
+            f"CURRENT Kenyan PSC")
+    r.check("...and the count agrees",
+            psc_index.count_companies() == 3,
+            f"count_companies()={psc_index.count_companies()}, "
+            f"rows={len(rows)}")
+    r.check("the per-record count still differs, as it should",
+            psc_index.count() == 5,
+            f"count()={psc_index.count()} - 5 current records")
+
+    first = rows[0]
+    r.check("a company with three PSCs says so",
+            first.get("psc_count") == 3, repr(first)[:220])
+    r.check("...and names all three",
+            all(n in (first.get("psc_name") or "")
+                for n in ("Ann K", "Ben K", "Cal K")), repr(first)[:220])
+    r.check("a ceased PSC is not counted in its company's total",
+            next(x for x in rows if x["company_number"] == "00000004")
+            .get("psc_count") == 1,
+            "00000004 has one current and one ceased")
+
+    r.check("include_ceased brings the ceased-only company back",
+            psc_index.count_companies(include_ceased=True) == 4,
+            f"got {psc_index.count_companies(include_ceased=True)}")
+
+    # Paging by company must cover each exactly once.
+    seen, off = [], 0
+    while True:
+        page = psc_index.search_companies(limit=2, offset=off)
+        if not page:
+            break
+        seen += [x["company_number"] for x in page]
+        off += 2
+        if off > 100:
+            break
+    r.check("paging covers every company exactly once",
+            seen == ["00000001", "00000002", "00000004"],
+            f"{seen}")
+
+    r.check("a query matching one PSC surfaces their company once",
+            [x["company_number"] for x in psc_index.search_companies(q="Ben K")]
+            == ["00000001"],
+            repr(psc_index.search_companies(q="Ben K")))
+
+    with db._cursor() as cur:
+        cur.execute(f"DELETE FROM {psc_index.TABLE}")
+
+
 def main() -> int:
     r = Results()
     print("test_pagination.py - paging the PSC index")
@@ -313,6 +460,9 @@ def main() -> int:
     check_the_admin_page_can_page(r)
     check_the_add_dialog_can_page(r)
     check_against_postgres(r)
+    check_company_grouping_pairs_too(r)
+    check_candidates_route_pages_by_company(r)
+    check_grouping_against_postgres(r)
     return r.report()
 
 
