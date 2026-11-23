@@ -1863,7 +1863,7 @@ function icPrivacy(val, domain) {
     <div class="info-value" style="font-size:12px">
       <a class="ic-link" href="${x(val)}" target="_blank" rel="noopener">${x(val)} ↗</a>
       <button class="ic-copy-btn" title="Copy privacy policy URL"
-        onclick="navigator.clipboard.writeText(${JSON.stringify(val)}).then(()=>toast('Privacy policy URL copied','success'))">⧉</button>
+        onclick="navigator.clipboard.writeText(${jsq(val)}).then(()=>toast('Privacy policy URL copied','success'))">⧉</button>
     </div>
   </div>`;
 }
@@ -1927,7 +1927,7 @@ function renderPcSection(d, pc) {
   const ppUrl = d.privacy_policy_url
     ? `<a class="pc-pp-link" href="${x(d.privacy_policy_url)}" target="_blank">${x(d.privacy_policy_url)}</a>
        <button class="btn btn-sm btn-ghost" style="flex-shrink:0"
-         onclick="navigator.clipboard.writeText(${JSON.stringify(d.privacy_policy_url)}).then(()=>toast('Copied','success'))">Copy</button>`
+         onclick="navigator.clipboard.writeText(${jsq(d.privacy_policy_url)}).then(()=>toast('Copied','success'))">Copy</button>`
     : `<span class="pc-pp-empty">Not generated yet — run the App stage</span>`;
 
   return `
@@ -2685,7 +2685,7 @@ async function doAddSearch(q, deep) {
     const canDeepen = !Array.isArray(resp) && resp.can_deepen;
     const deepBtn = canDeepen
       ? ` <button class="btn btn-sm btn-primary" style="margin-top:6px"
-            onclick="deepAddSearch(${JSON.stringify(q)})">Check all matches</button>`
+            onclick="deepAddSearch(${jsq(q)})">Check all matches</button>`
       : "";
     const kAdvice = kAdv
       ? `<br><span style="font-size:11px;color:var(--muted)">${x(kAdv)}</span>${deepBtn}`
@@ -2923,6 +2923,28 @@ function x(s) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+// A JS string literal that is safe INSIDE a double-quoted HTML attribute.
+//
+// `onclick="f(${JSON.stringify(v)})"` looks right and is broken: JSON uses
+// double quotes, so the browser ends the attribute at the first one and
+// onclick becomes the string "f(". Three buttons shipped that way - the
+// privacy-policy copy, the Play Console copy, and "Check all matches" -
+// and all three did nothing when clicked. Nothing in the markup looks
+// wrong, which is why it survived review.
+//
+// Single quotes delimit the literal so the attribute's own double quotes
+// are never closed; everything HTML-significant is then entity-escaped.
+function jsq(s) {
+  return "'" + String(s == null ? "" : s)
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/\r?\n/g, "\\n")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;") + "'";
 }
 
 function fmtSize(b) {

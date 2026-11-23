@@ -367,6 +367,91 @@ def _extract_js_function(src: str, name: str) -> str | None:
     return None
 
 
+def check_onclick_attributes_are_not_truncated(r: Results) -> None:
+    """A handler built with JSON.stringify ends the attribute it sits in.
+
+    `onclick="f(${JSON.stringify(v)})"` reads correctly and is broken: JSON
+    uses double quotes, so the browser closes the attribute at the first
+    one and onclick becomes the string "f(". The button renders, looks
+    right, and does nothing.
+
+    Three shipped that way - the privacy-policy copy button, the Play
+    Console copy button and "Check all matches" - and the first two were
+    reported working on the strength of the expected text being present in
+    the HTML, which it was. Presence is not parseability.
+
+    This scans every onclick in the page for the pattern, so the next one
+    fails here rather than silently in a browser.
+    """
+    print("\nonclick attributes (static/app.html)")
+    page = os.path.join(REPO, "static", "app.html")
+    with open(page, encoding="utf-8") as f:
+        src = f.read()
+
+    # Any ${...} interpolation that can emit a double quote truncates the
+    # attribute. JSON.stringify always does for a string.
+    lines = src.splitlines()
+    bad = []
+    for m in re.finditer(r'onclick="([^"]*)"', src):
+        body = m.group(1)
+        if "JSON.stringify" not in body:
+            continue
+        n = src[:m.start()].count("\n")
+        # A comment showing the broken pattern is how the next person
+        # learns why jsq exists; banning it would push the explanation out
+        # of the file that needs it.
+        text = lines[n].strip() if n < len(lines) else ""
+        if text.startswith("//") or text.startswith("*"):
+            continue
+        bad.append(f"line {n + 1}: {body[:70]}")
+    r.check("no onclick builds its argument with JSON.stringify", not bad,
+            "the attribute ends at the first double quote and the handler "
+            "becomes a fragment:\n        " + "\n        ".join(bad))
+
+    # The control: the scan must be able to see onclick attributes at all.
+    total = len(re.findall(r'onclick="', src))
+    r.check(f"{total} onclick attributes were scanned", total > 20,
+            "the scan found almost none, so finding no offenders means "
+            "nothing")
+
+    r.check("the page defines jsq() for this", "function jsq(" in src,
+            "there is no safe way to put a value into a handler")
+
+    # And jsq must actually survive the characters that break it. Run the
+    # SHIPPED function rather than a copy of it.
+    fn = _extract_js_function(src, "jsq")
+    if not r.check("jsq() is extractable", fn is not None, "cannot test it"):
+        return
+    if not shutil_which("node"):
+        r.skip("jsq escaping", "node is not on PATH")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        driver = os.path.join(td, "jsq_test.mjs")
+        with open(driver, "w", encoding="utf-8") as f:
+            f.write(fn + "\n")
+            f.write("""
+const vals = ["kimani", "O'Brien & Co", 'a"b', "x<script>", "back\\\\slash", null];
+const out = [];
+for (const v of vals) {
+  const html = `<button onclick="go(${jsq(v)})">x</button>`;
+  const m = html.match(/onclick="([^"]*)"/);
+  const attr = m ? m[1] : "";
+  // The attribute must contain the WHOLE call, not a fragment.
+  out.push([String(v), attr.startsWith("go(") && attr.endsWith(")")]);
+}
+console.log(JSON.stringify(out));
+""")
+        proc = subprocess.run(["node", driver], capture_output=True, text=True,
+                              timeout=60)
+        if not r.check("jsq runs in node", proc.returncode == 0,
+                       (proc.stderr or "")[-400:]):
+            return
+        for val, ok in json.loads(proc.stdout.strip().splitlines()[-1]):
+            r.check(f"jsq survives {val!r}", ok,
+                    "the attribute was truncated, so the handler is a "
+                    "fragment and the button does nothing")
+
+
 def check_stale_failure_does_not_outrank_reality(r: Results) -> None:
     """Observed artifacts beat a stale job record. Run in node.
 
@@ -933,6 +1018,7 @@ def main() -> int:
     check_a_genuinely_missing_company_is_still_404(r)
     check_the_list_still_works(r)
     check_sidebar_message(r)
+    check_onclick_attributes_are_not_truncated(r)
     check_stale_failure_does_not_outrank_reality(r)
     check_drawer_text(r)
     return r.report()
