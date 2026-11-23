@@ -299,8 +299,15 @@ def ingest(forms=None, on_progress=None, max_parts: int | None = None,
                 os.remove(tmp)
 
     companies = {r["company_number"] for r in rows}
+    # Current and ceased apart, in the summary too. A dry run that reports
+    # only a total invites planning around a number about a sixth larger
+    # than the companies actually controlled by a Kenyan person today.
+    ceased = [r for r in rows if r["ceased_on"]]
+    current_companies = {r["company_number"] for r in rows if not r["ceased_on"]}
     summary = {"status": "ok", "snapshot_date": date, "parts": len(parts),
-               "rows": len(rows), "companies": len(companies)}
+               "rows": len(rows), "companies": len(companies),
+               "ceased": len(ceased), "current": len(rows) - len(ceased),
+               "current_companies": len(current_companies)}
     if dry_run:
         summary["dry_run"] = True
         summary["sample"] = rows[:10]
