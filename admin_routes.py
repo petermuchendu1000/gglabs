@@ -234,6 +234,32 @@ _PAGE = """<!doctype html>
     <th>Last signed in</th><th>Actions</th></tr></thead>
     <tbody id="users"></tbody></table>
 
+  <h2>Kenyan PSC index</h2>
+  <div class="hint">
+    Companies House cannot be searched by nationality &mdash; its advanced
+    search filters on name, status, type, dates, location and SIC code, and
+    nothing else. This index is built from the free daily snapshot of
+    People with Significant Control, which does carry nationality, so the
+    search runs here instead of against the API.
+    <br><br>
+    <b>A PSC is not a director.</b> A PSC holds over 25% of shares or votes;
+    in a small company that is usually a director too, but it is a different
+    fact. These rows are candidates. Open one to ask Companies House whether
+    the <i>director</i> rule is actually met.
+  </div>
+  <div id="psc-status" class="hint">&hellip;</div>
+  <div style="margin:8px 0">
+    <button id="psc-refresh" onclick="pscRefresh()">Fetch latest snapshot</button>
+    <input id="psc-q" placeholder="company number or PSC name"
+           oninput="pscSearch()" style="margin-left:8px">
+  </div>
+  <pre id="psc-log" style="display:none;max-height:160px;overflow:auto;
+       font-size:11px;background:#111;padding:8px;border-radius:4px"></pre>
+  <table><thead><tr><th>Company</th><th>PSC</th><th>Nationality</th>
+    <th>Control</th><th>Director rule</th></tr></thead>
+    <tbody id="psc-rows"></tbody></table>
+  <div id="psc-detail"></div>
+
   <h2>Access log</h2>
   <div class="hint">Every approval, suspension, role change and password reset.</div>
   <table><thead><tr><th>When</th><th>Who</th><th>Did</th><th>To</th><th>Detail</th></tr></thead>
@@ -332,8 +358,231 @@ async function resetPw(id,email){
        toast("Password reset. Their current sessions were ended.","ok"); load(); }
   catch(e){ toast(e.message,"err"); }
 }
+// ── Kenyan PSC index ──────────────────────────────────────────────────
+let PSC_POLL = null;
+
+async function pscStatus(){
+  const d = await api("GET","/api/admin/psc/status");
+  const ix = d.index || {}, job = d.job || {};
+  const el = document.getElementById("psc-status");
+  if (ix.error) {
+    el.innerHTML = `<span style="color:#f88">index unavailable: ${esc(ix.error)}</span>`;
+  } else if (!ix.rows) {
+    el.innerHTML = "Index is empty. Fetch a snapshot to build it.";
+  } else {
+    el.innerHTML = `<b>${ix.rows}</b> Kenyan PSC records across `
+      + `<b>${ix.companies}</b> companies, from the snapshot of `
+      + `<b>${esc(ix.snapshot_date)}</b>.`;
+  }
+  const logEl = document.getElementById("psc-log");
+  const btn = document.getElementById("psc-refresh");
+  if (job.status === "running") {
+    btn.disabled = true;
+    btn.textContent = "Fetching…";
+    logEl.style.display = "block";
+    logEl.textContent = (job.log || []).join("\n");
+    logEl.scrollTop = logEl.scrollHeight;
+    if (!PSC_POLL) PSC_POLL = setInterval(pscStatus, 2000);
+  } else {
+    btn.disabled = false;
+    btn.textContent = "Fetch latest snapshot";
+    if (PSC_POLL) { clearInterval(PSC_POLL); PSC_POLL = null; }
+    if (job.status === "failed") {
+      logEl.style.display = "block";
+      logEl.textContent = (job.log || []).join("\n");
+    }
+    if (job.status === "done") pscSearch();
+  }
+}
+
+async function pscRefresh(){
+  // Said plainly before it starts: this is a couple of gigabytes over the
+  // server's connection and it REPLACES the table every search reads.
+  if (!confirm("Download today's PSC snapshot from Companies House?\n\n"
+             + "33 parts, roughly 2.4GB, several minutes. The index is "
+             + "replaced with the new snapshot when it finishes, so it "
+             + "always shows the register as it stands today.")) return;
+  try {
+    await api("POST","/api/admin/psc/refresh");
+    toast("Fetching the snapshot…","ok");
+    pscStatus();
+  } catch(e){ toast(e.message,"err"); }
+}
+
+async function pscSearch(){
+  const q = document.getElementById("psc-q").value.trim();
+  let d;
+  try { d = await api("GET","/api/admin/psc/search?q="+encodeURIComponent(q)); }
+  catch(e){ return; }
+  const rows = d.rows || [];
+  document.getElementById("psc-rows").innerHTML = rows.length
+    ? rows.map(r => `<tr style="cursor:pointer" onclick="pscOpen('${esc(r.company_number)}')">
+        <td>${esc(r.company_number)}${r.company_name ? "<br><small>"+esc(r.company_name)+"</small>" : ""}</td>
+        <td>${esc(r.psc_name)}</td>
+        <td>${esc(r.nationality)}</td>
+        <td><small>${esc(r.natures_of_control||"")}</small></td>
+        <td><small>${r.director_verdict ? esc(r.director_verdict) : "not checked"}</small></td>
+      </tr>`).join("")
+    : `<tr><td colspan="5" class="hint">No rows. ${q ? "Nothing matches that." : "Fetch a snapshot to build the index."}</td></tr>`;
+}
+
+async function pscOpen(cn){
+  const el = document.getElementById("psc-detail");
+  el.innerHTML = `<div class="hint">Asking Companies House about ${esc(cn)}…</div>`;
+  let d;
+  try { d = await api("GET","/api/admin/psc/company/"+encodeURIComponent(cn)); }
+  catch(e){ el.innerHTML = `<div class="hint" style="color:#f88">${esc(e.message)}</div>`; return; }
+  const c = d.company || {};
+  const dr = d.director_rule || {};
+  el.innerHTML = `
+    <h3>${esc(c.name || cn)} <small>${esc(cn)}</small></h3>
+    ${d.company_error ? `<div class="hint" style="color:#f88">Companies House: ${esc(d.company_error)}</div>` : ""}
+    <div class="hint">
+      ${esc(c.status||"")} ${c.type ? "· "+esc(c.type) : ""}
+      ${c.incorporated ? "· incorporated "+esc(c.incorporated) : ""}
+      ${(c.sic_codes||[]).length ? "· SIC "+esc((c.sic_codes||[]).join(", ")) : ""}
+    </div>
+    <div style="margin:8px 0;padding:8px;border-radius:4px;background:${dr.admissible ? "#13301c" : "#311"}">
+      <b>Director rule:</b> ${dr.admissible ? "admissible" : "not admissible"}
+      <br><small>${esc(dr.reason||"")}</small>
+      <br><small class="hint">From /company/${esc(cn)}/officers &mdash; the PSC
+      rows below are a different fact and do not decide this.</small>
+    </div>
+    <table><thead><tr><th>PSC</th><th>Nationality</th><th>Residence</th>
+      <th>Control</th><th>Notified</th></tr></thead><tbody>
+      ${(d.psc_rows||[]).map(p => `<tr>
+        <td>${esc(p.psc_name)}</td><td>${esc(p.nationality)}</td>
+        <td>${esc(p.country_of_residence||"")}</td>
+        <td><small>${esc(p.natures_of_control||"")}</small></td>
+        <td>${esc(p.notified_on||"")}</td></tr>`).join("")}
+    </tbody></table>`;
+  pscSearch();
+}
+
 load();
+pscStatus();
 </script></body></html>"""
+
+
+# ── The Kenyan PSC index ───────────────────────────────────────────────────
+#
+# Companies House cannot be searched by nationality; the free PSC snapshot
+# can. psc_index holds the detail and the measurements - this is only the
+# plumbing between it and the dashboard.
+#
+# The refresh runs in a thread with a progress log, like every other long
+# job here, because it downloads 33 parts and nobody should hold a request
+# open for that. One at a time: two concurrent rebuilds would race on the
+# delete-older-snapshots step and could empty the table between them.
+
+_psc_job: dict = {"status": "idle", "log": [], "summary": None}
+_psc_lock = __import__("threading").Lock()
+
+
+@admin.route("/api/admin/psc/status")
+def api_psc_status():
+    import psc_index
+    return jsonify({"index": psc_index.status(),
+                    "job": {"status": _psc_job["status"],
+                            "log": _psc_job["log"][-40:],
+                            "summary": _psc_job["summary"]}})
+
+
+@admin.route("/api/admin/psc/refresh", methods=["POST"])
+def api_psc_refresh():
+    """Rebuild the index from today's snapshot. Superadmin only.
+
+    Gated above admin because it replaces the table every company search
+    will read, and because it pulls a couple of gigabytes over the server's
+    connection. Approving a user and rebuilding the company universe are
+    different kinds of act.
+    """
+    err = _require_superadmin()
+    if err:
+        return err
+    import threading
+
+    import psc_index
+
+    with _psc_lock:
+        if _psc_job["status"] == "running":
+            return jsonify({"error": "a refresh is already running"}), 409
+        _psc_job.update(status="running", log=[], summary=None)
+
+    actor = _actor()
+    max_parts = request.args.get("parts", type=int)   # a smaller first run
+
+    def work():
+        try:
+            summary = psc_index.ingest(
+                on_progress=lambda m: _psc_job["log"].append(m),
+                max_parts=max_parts)
+            _psc_job["summary"] = summary
+            _psc_job["status"] = ("done" if summary.get("status") == "ok"
+                                  else "failed")
+            log.info("psc index refreshed by %s: %s", actor, summary)
+        except Exception as e:                       # noqa: BLE001
+            _psc_job["log"].append(f"failed: {type(e).__name__}: {e}")
+            _psc_job["status"] = "failed"
+            log.exception("psc index refresh failed")
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"status": "started"})
+
+
+@admin.route("/api/admin/psc/search")
+def api_psc_search():
+    import psc_index
+    return jsonify({"rows": psc_index.search(
+        q=request.args.get("q", ""),
+        limit=request.args.get("limit", default=50, type=int),
+        offset=request.args.get("offset", default=0, type=int))})
+
+
+@admin.route("/api/admin/psc/company/<cn>")
+def api_psc_company(cn):
+    """Everything known about one company: the index rows, and live
+    Companies House detail including whether the DIRECTOR rule is met.
+
+    The index says a Kenyan person controls this company. Whether a Kenyan
+    person DIRECTS it is a different question with a different source, and
+    it is answered here rather than inferred, so the screen can show both
+    and an operator can see when they disagree.
+    """
+    import api_v2
+    import psc_index
+
+    cn = api_v2._cn8(cn)
+    out: dict = {"company_number": cn,
+                 "psc_rows": [r for r in psc_index.search(q=cn, limit=50)
+                              if r["company_number"] == cn]}
+    try:
+        from run_pipeline import ch_get
+        profile = ch_get(f"/company/{cn}")
+        out["company"] = {
+            "name": profile.get("company_name"),
+            "status": profile.get("company_status"),
+            "type": profile.get("type"),
+            "incorporated": profile.get("date_of_creation"),
+            "sic_codes": profile.get("sic_codes") or [],
+            "address": profile.get("registered_office_address") or {},
+        }
+    except Exception as e:
+        out["company_error"] = str(e)
+
+    ok, why = api_v2._fetch_kenyan(cn)
+    out["director_rule"] = {"admissible": ok, "reason": why}
+    try:
+        psc_index.record_company_facts(
+            cn,
+            company_name=(out.get("company") or {}).get("name") or "",
+            company_status=(out.get("company") or {}).get("status") or "",
+            director_verdict=("admissible" if ok else why)[:200])
+    except Exception:
+        # Caching a name is a convenience. Failing to cache it must not
+        # fail the lookup the operator actually asked for.
+        pass
+    return jsonify(out)
 
 
 @admin.route("/admin")
