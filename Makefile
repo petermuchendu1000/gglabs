@@ -36,7 +36,8 @@ HERMETIC_TESTS := \
 	test_privacy_site.py \
 	test_psc_index.py \
 	test_row_completeness.py \
-	test_stage_feedback.py
+	test_stage_feedback.py \
+	test_users_cli.py
 
 .PHONY: help test e2e
 

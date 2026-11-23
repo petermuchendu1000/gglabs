@@ -340,6 +340,34 @@ def set_password(user_id: int, new_password: str, actor: str,
     record(actor, "user.password_change", row["email"], "sessions invalidated")
 
 
+def set_password_by_email(email: str, new_password: str, actor: str,
+                          must_change: bool = False) -> dict:
+    """Set one account's password, naming it by address rather than by id.
+
+    The data layer wants an id. A person at a console has an email, and an
+    id is the wrong thing to type there: a number carries nothing on its
+    face that says it is the account you meant, so a mistyped one resets a
+    stranger silently and leaves the intended account untouched.
+
+    Raises rather than returning None when the address resolves to nothing.
+    A falsy return would let the caller print "password set" for a reset
+    that wrote no row - and the person would then read their failed
+    sign-in as a wrong password rather than as a reset that never
+    happened. Returns the row so the caller can print back WHICH account
+    it changed, which is the only evidence available at a console that the
+    right one was hit.
+
+    Deliberately does not validate the password here: set_password does,
+    and a second copy of the rule is a second thing to keep in step.
+    """
+    user = get_by_email(email)
+    if user is None:
+        raise UserError(f"No account with the address {email}.")
+    set_password(user["id"], new_password, actor=actor,
+                 must_change=must_change)
+    return user
+
+
 def set_status(user_id: int, status: str, actor: str) -> dict:
     if status not in STATUSES:
         raise UserError(f"Unknown status: {status}")
@@ -495,6 +523,33 @@ if __name__ == "__main__":
                       f"its password at first sign-in.")
         print(f"\n  superadmins now active: {count_active_superadmins()}")
 
+    elif _cmd == "--passwd":
+        # Exists so that a console reset is a short, typeable command. The
+        # equivalent `python3 -c` is ~180 characters of nested quoting on a
+        # serial terminal that has already corrupted one long line this
+        # month, and a line mangled halfway through is worse than one that
+        # does not run: the import succeeds and the write may or may not.
+        if len(sys.argv) < 4:
+            print("  usage: users.py --passwd <email> <password> "
+                  "[--force-change]")
+            sys.exit(2)
+        _email, _pw = sys.argv[2], sys.argv[3]
+        _force = "--force-change" in sys.argv[4:]
+        try:
+            _u = set_password_by_email(_email, _pw, actor="console",
+                                       must_change=_force)
+        except UserError as _e:
+            # Non-zero, because this is typed into a shell where the next
+            # thing after && must not run on a reset that did not happen.
+            print(f"  REFUSED: {_e}")
+            sys.exit(1)
+        print(f"  password set for id={_u['id']}  {_u['email']}")
+        print(f"    role={_u['role']}  status={_u['status']}")
+        print(f"    must change it at next sign-in: {_force}")
+        print("    every session that account had is now invalid.")
+        print("  NOTE: the password was passed on the command line, so it "
+              "is in this shell's history and was visible in `ps`.")
+
     elif _cmd == "--list":
         for u in list_users():
             print(f"  {u['id']:>4}  {u['email']:32s} {u['role']:11s} "
@@ -507,4 +562,6 @@ if __name__ == "__main__":
         print("  --init   create the accounts schema and the bootstrap"
               " superadmin from .env")
         print("  --list   list accounts (read-only)")
+        print("  --passwd <email> <password> [--force-change]")
+        print("           set one account's password, naming it by address")
         sys.exit(2)
