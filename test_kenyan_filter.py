@@ -75,6 +75,12 @@ SC461938 = [officer("British"), officer("British"),
             officer("British,Kenyan"), officer("Greek")]        # KWISA
 ACME     = [officer("British")]                                 # ACME ADVISORY LTD
 NAIROBI  = [officer("British,Irish"), officer(None)]            # NAIROBI BUSINESS ANGELS
+# A confirmed Kenyan director sitting next to one whose nationality nobody
+# filed. This is the case the rule change is about, and it is common: the
+# docstring's own sample had 2 of 60 directors with no nationality on
+# record, so any company with a handful of directors is a coin toss.
+KENYAN_PLUS_BLANK = [officer("Kenyan"), officer(None)]
+KENYAN_PLUS_TWO_BLANK = [officer("Kenyan"), officer(None), officer(None)]
 
 
 # ── the nationality parser ──────────────────────────────────────────────
@@ -120,12 +126,30 @@ def check_rule(r: Results) -> None:
     r.check("a British-only company is refused", not ok, why)
     r.check("...and says why", "no Kenyan director" in why, f"said {why!r}")
 
-    # The second half of the rule, and a real case: 2 of 60 sampled
-    # directors had no nationality on record.
+    # THE RULE IS "at least one active director is Kenyan" AND NOTHING
+    # ELSE. It used to also refuse any company where an active director's
+    # nationality was unrecorded, which is a completeness rule, not the
+    # admission rule: if one director is recorded Kenyan, the condition is
+    # met, and what some other director did or did not file cannot unmeet
+    # it. In practice that clause hid eligible companies - searching
+    # "kimani" showed 8 candidates and admitted none.
+    ok, why = v(KENYAN_PLUS_BLANK)
+    r.check("a Kenyan director beside an unrecorded one is ADMITTED", ok,
+            f"said {why!r} - an eligible company is being hidden because "
+            f"somebody else's paperwork is incomplete")
+    r.check("...and counts only what is known",
+            "1 of 2" in why, f"said {why!r}")
+
+    ok, why = v(KENYAN_PLUS_TWO_BLANK)
+    r.check("still admitted with two unrecorded directors", ok, why)
+
+    # Unchanged: no Kenyan director is still a refusal. NAIROBI has none -
+    # British,Irish and one blank - so it stays out, and the reason should
+    # now name the real cause rather than the paperwork.
     ok, why = v(NAIROBI)
-    r.check("an unrecorded nationality refuses the company", not ok, why)
-    r.check("...and says so specifically",
-            "no nationality recorded" in why, f"said {why!r}")
+    r.check("a company with no Kenyan director is still refused", not ok, why)
+    r.check("...and the reason names the real cause",
+            "no Kenyan director" in why, f"said {why!r}")
 
     print("\n-- the edges --")
     r.check("no officers at all is refused", not v([])[0])
@@ -244,6 +268,87 @@ def check_fetch(r: Results) -> None:
         if saved_key2 is not None:
             os.environ["COMPANIES_HOUSE_API_KEY"] = saved_key2
     api_v2._nat_cache.clear()
+
+
+def check_search_pages_through_results(r: Results) -> None:
+    """One page of 20 is not "the whole database".
+
+    Searching "kimani" reported "25 companies match" and checked 8. Three
+    separate things capped it: /search/companies was called once with
+    items_per_page=20, so 5 of the 25 were never fetched at all; the active
+    filter cut those 20 down; and the examine ceiling was 12.
+
+    The search box is a type-ahead on a 120ms debounce, so the per-keystroke
+    budget has to stay small - but a deliberate "check all of them" must be
+    able to page through everything the query matches.
+    """
+    print("\n-- the search pages through Companies House --")
+    calls = []
+
+    def fake_ch_get(path, params=None):
+        calls.append((path, dict(params or {})))
+        start = int((params or {}).get("start_index", 0))
+        per = int((params or {}).get("items_per_page", 20))
+        # 25 active companies, numbered 00000001..00000025.
+        items = [{"company_number": "%08d" % (i + 1),
+                  "title": "KIMANI CO %d" % (i + 1),
+                  "company_status": "active",
+                  "date_of_creation": "2024-01-01"}
+                 for i in range(start, min(start + per, 25))]
+        return {"total_results": 25, "items": items}
+
+    cands, total, scanned = api_v2._ch_search_candidates(
+        "kimani", fake_ch_get, year_filter=None, seen=set(), want=25)
+
+    r.check("every matching company was reached", len(cands) == 25,
+            f"got {len(cands)} of 25 - companies past the first page are "
+            f"invisible")
+    r.check("the total is reported", total == 25, f"got {total}")
+    r.check("...and it took more than one call", len(calls) > 1,
+            f"calls={calls!r}")
+    r.check("...and paged with start_index",
+            any(c[1].get("start_index") for c in calls), f"calls={calls!r}")
+
+    # It must stop as soon as it has what was asked for, not keep paging.
+    calls.clear()
+    cands, _total, _scanned = api_v2._ch_search_candidates(
+        "kimani", fake_ch_get, year_filter=None, seen=set(), want=5)
+    r.check("it stops once `want` candidates are collected", len(cands) == 5,
+            f"got {len(cands)} - a type-ahead would spend the whole quota")
+    r.check("...after a single page", len(calls) == 1, f"calls={calls!r}")
+
+    # And it must not loop for ever when the results run out.
+    calls.clear()
+
+    def empty_ch_get(path, params=None):
+        calls.append(path)
+        return {"total_results": 0, "items": []}
+
+    cands, total, _scanned = api_v2._ch_search_candidates(
+        "nothing", empty_ch_get, year_filter=None, seen=set(), want=100)
+    r.check("an empty result set stops immediately",
+            cands == [] and len(calls) == 1, f"calls={len(calls)}")
+
+    # Dissolved companies and ones already in the pipeline are skipped, but
+    # skipping them must not end the paging early.
+    def mixed_ch_get(path, params=None):
+        start = int((params or {}).get("start_index", 0))
+        per = int((params or {}).get("items_per_page", 20))
+        out = []
+        for i in range(start, min(start + per, 40)):
+            out.append({"company_number": "%08d" % (i + 1),
+                        "title": "CO %d" % (i + 1),
+                        # every other one dissolved
+                        "company_status": "active" if i % 2 == 0 else "dissolved",
+                        "date_of_creation": "2024-01-01"})
+        return {"total_results": 40, "items": out}
+
+    cands, _t, scanned = api_v2._ch_search_candidates(
+        "mixed", mixed_ch_get, year_filter=None, seen=set(), want=20)
+    r.check("dissolved companies are skipped without ending the search",
+            len(cands) == 20 and scanned == 40,
+            f"got {len(cands)} candidates from {scanned} scanned - the "
+            f"active filter must not be mistaken for the end of the results")
 
 
 def check_filter(r: Results) -> None:
@@ -513,6 +618,7 @@ def main() -> int:
     check_parser(r)
     check_rule(r)
     check_fetch(r)
+    check_search_pages_through_results(r)
     check_filter(r)
     check_quota_reservation(r)
     check_pooled_session(r)

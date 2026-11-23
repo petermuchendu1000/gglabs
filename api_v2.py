@@ -1132,7 +1132,20 @@ def v2_job(cn, stage):
 #   - verdicts are cached, because a company's directors do not change
 #     between keystrokes.
 _NAT_TTL = 24 * 3600          # a directorship does not change hourly
-_NAT_MAX_PER_SEARCH = 12      # hard ceiling on requests one search may spend
+# Two ceilings, because there are two kinds of search.
+#
+# The box is a type-ahead on a 120ms debounce (static/app.html), so a pause
+# while typing "kimani" fires several searches. A per-keystroke budget has
+# to stay small or one word of typing spends the window.
+#
+# A deliberate "check all of them" is a different thing: one click, once,
+# and the operator is waiting for it. It may page through the whole result
+# set and spend an order of magnitude more. Verdicts are cached for 24h, so
+# the second deep search of the same term is nearly free.
+_NAT_MAX_PER_SEARCH = 20      # per keystroke-pause
+_NAT_MAX_DEEP = 100           # an explicit "check all of them"
+_CH_PAGE = 20                 # page size run_pipeline already uses
+_CH_MAX_PAGES = 10            # 200 companies scanned, 10 cheap search calls
 _NAT_MIN_REMAIN = 150         # a RESERVATION: never spend below this
 _nat_cache: dict[str, tuple[float, bool, str]] = {}
 _off_cache: dict[str, tuple[float, list]] = {}   # the officer payload itself
@@ -1163,28 +1176,40 @@ _KENYAN = directors.KENYAN
 
 
 def _kenyan_verdict(items: list[dict]) -> tuple[bool, str]:
-    """Admit iff at least one ACTIVE DIRECTOR is Kenyan, and no active
-    director's nationality is unrecorded.
+    """Admit iff AT LEAST ONE ACTIVE DIRECTOR IS KENYAN. That is the whole
+    rule.
 
-    Both halves were chosen deliberately. "At least one" admits
-    KENYA AIRWAYS PLC, whose active directors are Kenyan, Canadian and
-    Swedish, and admits a dual national ('British,Kenyan'). The second half
-    is why a company with a Kenyan director and another whose nationality is
-    blank is refused: unknown is not Kenyan, and 2 of 60 sampled directors
-    had no nationality on record, so this is a real case and not a
-    hypothetical.
+    "At least one" admits KENYA AIRWAYS PLC, whose active directors are
+    Kenyan, Canadian and Swedish, and admits a dual national
+    ('British,Kenyan').
+
+    THERE USED TO BE A SECOND CLAUSE and it was removed deliberately: any
+    company with an active director whose nationality was unrecorded was
+    refused, even when another director was recorded Kenyan. That is a
+    data-completeness rule, not an admission rule. If one director is on
+    record as Kenyan the condition is satisfied, and what somebody else
+    failed to file cannot unsatisfy it.
+
+    It was not a rare edge either. The old docstring's own sample had 2 of
+    60 directors with no nationality on record, so any company with a few
+    directors was close to a coin toss - searching "kimani" turned up 8
+    candidates and admitted none of them.
 
     Change this function to change the rule; nothing else encodes it.
     """
     actives = directors.active_directors(items)
     if not actives:
         return False, "no active directors on record"
-    unknown = sum(1 for o in actives if not _nationalities(o))
-    if unknown:
-        return False, (f"{unknown} of {len(actives)} active directors have no "
-                       f"nationality recorded")
     kenyan = sum(1 for o in actives if _KENYAN in _nationalities(o))
     if not kenyan:
+        unknown = sum(1 for o in actives if not _nationalities(o))
+        # Say when the answer rests on missing data, so an operator can tell
+        # "none of these is Kenyan" from "nobody filed it". The company is
+        # refused either way - an admission must be positively established -
+        # but the two call for different next steps.
+        if unknown:
+            return False, (f"no Kenyan director among {len(actives)} active "
+                           f"({unknown} with no nationality recorded)")
         return False, f"no Kenyan director among {len(actives)} active"
     return True, f"{kenyan} of {len(actives)} active directors Kenyan"
 
@@ -1295,7 +1320,66 @@ def _autofill_company(cn: str) -> tuple[dict, str]:
     return updates, ""
 
 
-def _apply_kenyan_filter(cands: list[dict]) -> tuple[list[dict], int, str]:
+def _ch_search_candidates(q: str, ch_get, year_filter, seen: set,
+                          want: int) -> tuple[list[dict], int, int]:
+    """Page through Companies House for admissible-shaped candidates.
+
+    Returns (candidates, total_results, scanned).
+
+    One call with items_per_page=20 was "the whole database": a search
+    reporting 25 matches never fetched 5 of them, and the active filter
+    then cut the 20 that were fetched down to 8. Paging costs one cheap
+    search request per 20 companies - the expensive part is the officers
+    lookup per candidate, which `want` bounds.
+
+    Stops at the first of: `want` candidates collected, the results
+    exhausted, or the page budget spent. Skipping a dissolved company does
+    NOT end the search - that conflation is what made a page of mostly
+    dissolved companies look like the end of the results.
+    """
+    cands: list[dict] = []
+    total = 0
+    scanned = 0
+    for page in range(_CH_MAX_PAGES):
+        data = ch_get("/search/companies",
+                      {"q": q, "items_per_page": _CH_PAGE,
+                       "start_index": page * _CH_PAGE})
+        total = int(data.get("total_results") or total)
+        items = data.get("items") or []
+        if not items:
+            break
+        scanned += len(items)
+        for item in items:
+            if str(item.get("company_status", "")).lower() != "active":
+                continue
+            item_cn = _cn8(item.get("company_number", ""))
+            if item_cn in seen:
+                continue
+            inc = item.get("date_of_creation", "") or ""
+            yr = inc[:4] if inc else ""
+            if year_filter and yr not in year_filter:
+                continue
+            seen.add(item_cn)
+            cands.append({
+                "cn": item_cn,
+                "name": item.get("title", ""),
+                "directors": "",
+                "n_done": 0,
+                "stages": {s: False for s in STAGE_ORDER},
+                "source": "ch_api",
+                "date_of_creation": inc,
+                "year": yr,
+            })
+            if len(cands) >= want:
+                return cands, total, scanned
+        if scanned >= total:
+            break
+    return cands, total, scanned
+
+
+def _apply_kenyan_filter(cands: list[dict],
+                         budget: int = _NAT_MAX_PER_SEARCH
+                         ) -> tuple[list[dict], int, str]:
     """Keep only admissible candidates. Returns (kept, excluded, note)."""
     if not cands:
         return [], 0, ""
@@ -1317,7 +1401,7 @@ def _apply_kenyan_filter(cands: list[dict]) -> tuple[list[dict], int, str]:
                        f"reserved for the pipeline stages. Try again shortly, "
                        f"or enter the company number.")
 
-    budget = min(len(cands), _NAT_MAX_PER_SEARCH)
+    budget = min(len(cands), budget)
     examined, kept = cands[:budget], []
     unexamined = len(cands) - budget
 
@@ -1335,8 +1419,7 @@ def _apply_kenyan_filter(cands: list[dict]) -> tuple[list[dict], int, str]:
     if excluded:
         bits.append(f"{excluded} hidden (no Kenyan director)")
     if unexamined:
-        bits.append(f"{unexamined} not checked (limit {_NAT_MAX_PER_SEARCH} "
-                    f"per search)")
+        bits.append(f"{unexamined} not checked (limit {budget} per search)")
     rem = _ch_remain[0]
     if rem is not None and rem < _NAT_MIN_REMAIN * 2:
         bits.append(f"Companies House quota getting low ({rem} left this "
@@ -1355,6 +1438,15 @@ def v2_search():
     # Optional year-of-registration filter: ?years=2020,2021,2022
     years_param = request.args.get("years", "").strip()
     year_filter = {y.strip() for y in years_param.split(",") if y.strip()}
+
+    # ?deep=1 — the operator asked to check every match rather than the
+    # handful a keystroke can afford. One click, once, and they are waiting
+    # for it, so it may page through the result set and spend an order of
+    # magnitude more of the Companies House window. The reservation in
+    # _apply_kenyan_filter still applies, so a deep search cannot starve the
+    # pipeline stages.
+    deep = request.args.get("deep", "").strip() in ("1", "true", "yes")
+    budget = _NAT_MAX_DEEP if deep else _NAT_MAX_PER_SEARCH
 
     rows = _all_rows()
     results = []
@@ -1391,26 +1483,9 @@ def v2_search():
         try:
             sys.path.insert(0, str(ROOT))
             from run_pipeline import ch_get
-            data = ch_get(f"/search/companies?q={q}&items_per_page=20")
-            ch_total = int(data.get("total_results") or 0)
-            for item in (data.get("items") or []):
-                if item.get("company_status", "").lower() != "active": continue
-                item_cn = _cn8(item.get("company_number", ""))
-                if any(c["cn"] == item_cn for c in results): continue
-                inc = item.get("date_of_creation", "") or ""
-                yr  = inc[:4] if inc else ""
-                if year_filter and yr not in year_filter:
-                    continue
-                ch_candidates.append({
-                    "cn":        item_cn,
-                    "name":      item.get("title", ""),
-                    "directors": "",
-                    "n_done":    0,
-                    "stages":    {s: False for s in STAGE_ORDER},
-                    "source":    "ch_api",
-                    "date_of_creation": inc,
-                    "year":      yr,
-                })
+            ch_candidates, ch_total, _scanned = _ch_search_candidates(
+                q, ch_get, year_filter,
+                seen={c["cn"] for c in results}, want=budget)
         except Exception as e:
             ch_error = str(e)
             print(f"  CH search error: {e}")
@@ -1420,10 +1495,13 @@ def v2_search():
         # companies ALREADY in the pipeline - filtering those would make an
         # operator unable to find their own companies, which is a different
         # and worse bug than showing one that no longer qualifies.
-        kept, kenyan_excluded, kenyan_note = _apply_kenyan_filter(ch_candidates)
+        kept, kenyan_excluded, kenyan_note = _apply_kenyan_filter(
+            ch_candidates, budget=budget)
         results.extend(kept)
 
-    resp: dict = {"results": results[:10]}
+    # 10 was a tighter cap than the examine budget, so a deep search could
+    # establish that 18 companies qualify and then show 10 of them.
+    resp: dict = {"results": results[:budget]}
     if ch_error:
         resp["ch_error"] = ch_error
     # Said out loud, always. An empty list that means "none of the matches
@@ -1445,12 +1523,22 @@ def v2_search():
         # and narrow it, or enter the number - which returns exactly one
         # candidate and so costs two requests in total.
         resp["ch_total"] = ch_total
-        if ch_total > len(ch_candidates):
+        checked = min(len(ch_candidates), budget)
+        resp["ch_checked"] = checked
+        resp["deep"] = deep
+        if ch_total > checked:
+            # Offered as a thing the operator can DO, not just a limit they
+            # are told about. The old message said "narrow the search",
+            # which is the opposite of what somebody wants when the company
+            # they are after is sitting past the ceiling.
+            resp["can_deepen"] = not deep
             resp["kenyan_advice"] = (
-                f"{ch_total} companies match. Only the first "
-                f"{min(len(ch_candidates), _NAT_MAX_PER_SEARCH)} were checked "
-                f"for a Kenyan director - narrow the search, or enter the "
-                f"8-character company number to check one exactly.")
+                f"{ch_total} companies match and {checked} were checked for "
+                f"a Kenyan director."
+                + ("" if deep else
+                   " Use “Check all matches” to go through the rest.")
+                + " Entering the 8-character company number checks one"
+                  " exactly.")
     return jsonify(resp)
 
 

@@ -2642,12 +2642,25 @@ document.getElementById("add-input").addEventListener("input", e => {
   S.addDebounce = setTimeout(() => doAddSearch(q), 380);
 });
 
-async function doAddSearch(q) {
+// The deep search is a DELIBERATE action, never a keystroke. The box is a
+// type-ahead on a 120ms debounce, so a per-keystroke budget has to stay
+// small; this is the "I know what I am looking for, go and check all of
+// them" button, which pages through the whole result set.
+async function deepAddSearch(q) {
+  const status = document.getElementById("add-status");
+  status.innerHTML = `Checking every match for a Kenyan director… `
+    + `<span style="font-size:11px;color:var(--muted)">this takes a few `
+    + `seconds and asks Companies House about each company in turn</span>`;
+  await doAddSearch(q, true);
+}
+
+async function doAddSearch(q, deep) {
   const status = document.getElementById("add-status");
   const el     = document.getElementById("add-results");
   try {
     const yearsQ  = S.addYears.size ? `&years=${[...S.addYears].join(",")}` : "";
-    const resp    = await api("GET", `/api/v2/company/search?q=${encodeURIComponent(q)}${yearsQ}`);
+    const deepQ   = deep ? "&deep=1" : "";
+    const resp    = await api("GET", `/api/v2/company/search?q=${encodeURIComponent(q)}${yearsQ}${deepQ}`);
     // Support both old array shape and new {results, ch_error} shape
     const results = Array.isArray(resp) ? resp : (resp.results || []);
     const chErr   = Array.isArray(resp) ? null  : resp.ch_error;
@@ -2666,9 +2679,17 @@ async function doAddSearch(q) {
     // How broad the search was. Without this, an eligible company sitting
     // past the examine ceiling is simply invisible.
     const kAdv   = Array.isArray(resp) ? "" : (resp.kenyan_advice || "");
-    const kAdvice = kAdv
-      ? `<br><span style="font-size:11px;color:var(--muted)">${x(kAdv)}</span>`
+    // Offered as a button, not just described. "Narrow the search" was the
+    // opposite of what an operator wants when the company they are after
+    // is sitting past the ceiling.
+    const canDeepen = !Array.isArray(resp) && resp.can_deepen;
+    const deepBtn = canDeepen
+      ? ` <button class="btn btn-sm btn-primary" style="margin-top:6px"
+            onclick="deepAddSearch(${JSON.stringify(q)})">Check all matches</button>`
       : "";
+    const kAdvice = kAdv
+      ? `<br><span style="font-size:11px;color:var(--muted)">${x(kAdv)}</span>${deepBtn}`
+      : deepBtn;
 
     if (!results.length) {
       let note;
