@@ -276,6 +276,11 @@ _PAGE = """<!doctype html>
     <th>Nationality</th><th>Residence</th><th>Control</th>
     <th>Director rule</th></tr></thead>
     <tbody id="psc-rows"></tbody></table>
+  <div style="margin:8px 0;display:flex;align-items:center;gap:8px">
+    <button id="psc-prev" onclick="pscPage(-1)">&larr; Previous</button>
+    <button id="psc-next" onclick="pscPage(1)">Next &rarr;</button>
+    <span id="psc-range" class="hint"></span>
+  </div>
   <div id="psc-detail"></div>
 
   <h2>Access log</h2>
@@ -429,13 +434,28 @@ async function pscRefresh(){
   } catch(e){ toast(e.message,"err"); }
 }
 
-async function pscSearch(){
+const PSC_LIMIT = 50;
+let PSC_OFFSET = 0;
+
+function pscPage(delta){
+  PSC_OFFSET = Math.max(0, PSC_OFFSET + delta * PSC_LIMIT);
+  pscSearch(true);
+}
+
+async function pscSearch(keepPage){
+  // Any change to the query or the ceased filter starts again at the
+  // first page. Keeping page 4 while the result set changes under it
+  // shows an empty table for a query that does have matches, and reads
+  // as missing data rather than as the wrong page.
+  if (!keepPage) PSC_OFFSET = 0;
   const q = document.getElementById("psc-q").value.trim();
   const inc = document.getElementById("psc-ceased").checked ? "&ceased=1" : "";
   let d;
-  try { d = await api("GET","/api/admin/psc/search?q="+encodeURIComponent(q)+inc); }
+  try { d = await api("GET","/api/admin/psc/search?q="+encodeURIComponent(q)+inc
+                            +"&limit="+PSC_LIMIT+"&offset="+PSC_OFFSET); }
   catch(e){ return; }
   const rows = d.rows || [];
+  pscPager(rows.length, d.total);
   const born = r => r.dob_year
     ? String(r.dob_month||"?").padStart(2,"0") + "/" + r.dob_year : "—";
   document.getElementById("psc-rows").innerHTML = rows.length
@@ -450,6 +470,28 @@ async function pscSearch(){
         <td><small>${r.director_verdict ? esc(r.director_verdict) : "not checked"}</small></td>
       </tr>`).join("")
     : `<tr><td colspan="7" class="hint">No rows. ${q ? "Nothing matches that." : "Fetch a snapshot to build the index."}</td></tr>`;
+}
+
+function pscPager(shown, total){
+  // total is absent only if the route could not count. Say "shown" then,
+  // rather than inventing a total - a wrong one is worse than none,
+  // because it is the number an operator would trust.
+  const range = document.getElementById("psc-range");
+  const prev = document.getElementById("psc-prev");
+  const next = document.getElementById("psc-next");
+  const last = PSC_OFFSET + shown;
+  if (typeof total !== "number") {
+    range.textContent = shown + " shown";
+    next.disabled = shown < PSC_LIMIT;
+  } else if (total === 0) {
+    range.textContent = "No matching rows";
+    next.disabled = true;
+  } else {
+    range.textContent = "Showing " + (PSC_OFFSET + 1) + "\\u2013" + last
+                      + " of " + total;
+    next.disabled = last >= total;
+  }
+  prev.disabled = PSC_OFFSET <= 0;
 }
 
 async function pscOpen(cn){
@@ -494,6 +536,10 @@ async function pscOpen(cn){
 
 load();
 pscStatus();
+// The table was only ever filled when a fetch job finished, so opening
+// this page with an index already built showed column headings over
+// nothing - which reads as an empty index rather than an unasked query.
+pscSearch();
 </script></body></html>"""
 
 
@@ -567,11 +613,16 @@ def api_psc_refresh():
 def api_psc_search():
     import psc_index
     inc = request.args.get("ceased", "").strip() in ("1", "true", "yes")
-    return jsonify({"rows": psc_index.search(
-        q=request.args.get("q", ""),
-        limit=request.args.get("limit", default=50, type=int),
-        offset=request.args.get("offset", default=0, type=int),
-        include_ceased=inc)})
+    q = request.args.get("q", "")
+    limit = max(1, min(request.args.get("limit", default=50, type=int), 500))
+    offset = max(0, request.args.get("offset", default=0, type=int))
+    # The total comes back with every page. Without it the screen cannot
+    # say whether a short page is the end of the set or the end of one
+    # page, and cannot offer Next honestly.
+    return jsonify({"rows": psc_index.search(q=q, limit=limit, offset=offset,
+                                             include_ceased=inc),
+                    "total": psc_index.count(q=q, include_ceased=inc),
+                    "limit": limit, "offset": offset})
 
 
 @admin.route("/api/admin/psc/company/<cn>")

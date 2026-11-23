@@ -33,6 +33,7 @@ HERMETIC_TESTS := \
 	test_kenyan_filter.py \
 	test_match_stage.py \
 	test_no_committed_secrets.py \
+	test_pagination.py \
 	test_play_declarations.py \
 	test_privacy_site.py \
 	test_psc_index.py \

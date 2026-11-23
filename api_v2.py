@@ -1653,8 +1653,17 @@ def v2_candidates():
             entry["name"] = entry["name"] or str(prow.get("Company Name") or "")
         out.append(entry)
 
+    # The total matching the SAME query, so the dialog can say "25 of
+    # 6,759" rather than leaving an operator to guess whether a full page
+    # is the whole set. Counted separately from status(): status counts
+    # the index, this counts the search.
+    try:
+        total = psc_index.count(q=q)
+    except Exception:
+        total = None
+
     return jsonify({"rows": out, "index": psc_index.status(),
-                    "offset": offset, "limit": limit})
+                    "total": total, "offset": offset, "limit": limit})
 
 
 @api_v2.route("/api/v2/company/add", methods=["POST"])

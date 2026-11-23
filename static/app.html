@@ -1115,6 +1115,11 @@
       </div>
       <div id="add-status" style="font-size:12px;color:var(--muted);min-height:16px;"></div>
       <div class="search-results" id="add-results"></div>
+      <div id="cand-pager" style="display:none;align-items:center;gap:8px;margin-top:8px">
+        <button class="btn btn-sm" id="cand-prev" onclick="candPage(-1)">&larr; Previous</button>
+        <button class="btn btn-sm" id="cand-next" onclick="candPage(1)">Next &rarr;</button>
+        <span id="cand-range" style="font-size:11px;color:var(--muted)"></span>
+      </div>
     </div>
     <div class="modal-foot">
       <button class="btn" onclick="closeAddModal()">Cancel</button>
@@ -2655,13 +2660,30 @@ document.getElementById("add-input").addEventListener("input", e => {
 // when the company is added. The footer says so rather than letting the
 // list imply these are pre-approved.
 
-async function loadCandidates(q) {
+const CAND_LIMIT = 25;
+let CAND_OFFSET = 0;
+let CAND_Q = "";
+
+function candPage(delta) {
+  CAND_OFFSET = Math.max(0, CAND_OFFSET + delta * CAND_LIMIT);
+  loadCandidates(CAND_Q, true);
+}
+
+async function loadCandidates(q, keepPage) {
+  // A new query starts at the first page. Without this, typing while on
+  // page 5 asks for rows 100-125 of a result set that may now have three,
+  // and the dialog goes blank for a search that matches.
+  if (!keepPage) CAND_OFFSET = 0;
+  CAND_Q = q || "";
   const status = document.getElementById("add-status");
   const el = document.getElementById("add-results");
+  const pager = document.getElementById("cand-pager");
+  pager.style.display = "none";
   status.innerHTML = `<span class="spinner" style="width:10px;height:10px;border-width:2px;vertical-align:middle;margin-right:4px;"></span> Loading…`;
   let d;
   try {
-    d = await api("GET", "/api/v2/company/candidates?q=" + encodeURIComponent(q || ""));
+    d = await api("GET", "/api/v2/company/candidates?q=" + encodeURIComponent(q || "")
+                  + "&limit=" + CAND_LIMIT + "&offset=" + CAND_OFFSET);
   } catch (e) {
     status.textContent = "Could not read the index: " + e.message;
     el.innerHTML = "";
@@ -2689,8 +2711,16 @@ async function loadCandidates(q) {
     return;
   }
 
-  status.innerHTML = `${rows.length} of <b>${ix.current_companies || ix.companies || 0}</b> `
-    + `companies with a Kenyan person of significant control`
+  // "25 of 6,759" where the 6,759 is what THIS query matches, not the
+  // size of the whole index. Those differ the moment anything is typed,
+  // and the matching count is the one that tells you whether paging on
+  // is worth it.
+  const total = (typeof d.total === "number") ? d.total : null;
+  const shownTo = CAND_OFFSET + rows.length;
+  status.innerHTML = (total === null
+      ? `${rows.length} shown`
+      : `${CAND_OFFSET + 1}&ndash;${shownTo} of <b>${total}</b>`)
+    + ` companies with a Kenyan person of significant control`
     + (ix.snapshot_date ? ` (register of ${x(ix.snapshot_date)})` : "")
     + `. <span style="font-size:11px;color:var(--muted)">Click one to add it. `
     + `The director rule is checked as it is added &mdash; a controlling `
@@ -2725,6 +2755,18 @@ async function loadCandidates(q) {
     row.addEventListener("click", () =>
       addCompany(row.dataset.cn, row.dataset.name, row.dataset.doc));
   });
+
+  // Only shown when there is somewhere to go. A pair of dead buttons
+  // under a 12-row list is noise that teaches people to ignore them.
+  const more = total === null ? rows.length >= CAND_LIMIT : shownTo < total;
+  if (CAND_OFFSET > 0 || more) {
+    pager.style.display = "flex";
+    document.getElementById("cand-prev").disabled = CAND_OFFSET <= 0;
+    document.getElementById("cand-next").disabled = !more;
+    document.getElementById("cand-range").textContent =
+      total === null ? "" : "page " + (Math.floor(CAND_OFFSET / CAND_LIMIT) + 1)
+                            + " of " + Math.max(1, Math.ceil(total / CAND_LIMIT));
+  }
 }
 
 // The deep search is a DELIBERATE action, never a keystroke. The box is a

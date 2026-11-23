@@ -406,6 +406,46 @@ def status() -> dict:
         return {"error": str(e)}
 
 
+def _where(q: str = "", include_ceased: bool = False) -> tuple[str, list]:
+    """The filter shared by search() and count(), built once.
+
+    These two must answer the same question. A count that forgets the
+    ceased exclusion, or the query, does not fail: it produces a plausible
+    total above a list whose last pages are empty, and an operator reading
+    "showing 101-150 of 6,759" over a blank table concludes rows are
+    missing from the index rather than that the arithmetic is wrong.
+
+    Keeping one predicate makes that drift impossible rather than
+    unlikely, which is the only reason this is a function and not two
+    tidy copies of four lines.
+    """
+    where: list[str] = []
+    args: list = []
+    q = (q or "").strip()
+    if q:
+        where.append("(company_number ILIKE %s OR psc_name ILIKE %s)")
+        args += [f"%{q}%", f"%{q}%"]
+    if not include_ceased:
+        where.append("(ceased_on IS NULL OR ceased_on = '')")
+    return (" WHERE " + " AND ".join(where)) if where else "", args
+
+
+def count(q: str = "", include_ceased: bool = False) -> int:
+    """How many rows search() would return were it not for limit/offset.
+
+    Asks the database to count. Taking len() of a page would return the
+    page size, so the total would always equal what is on screen and a
+    Next button could never be offered.
+    """
+    import db
+    ensure_schema()
+    clause, args = _where(q, include_ceased)
+    with db._cursor() as cur:
+        cur.execute(f"SELECT count(*) AS n FROM {TABLE}{clause}", args)
+        row = cur.fetchone() or {}
+    return int(row.get("n") or 0)
+
+
 def search(q: str = "", limit: int = 50, offset: int = 0,
            include_ceased: bool = False) -> list[dict]:
     """Rows from the index. `q` matches a company number or a PSC name.
@@ -426,16 +466,8 @@ def search(q: str = "", limit: int = 50, offset: int = 0,
            f"surname, address, identity_verified_on, "
            f"company_name, company_status, director_verdict, snapshot_date "
            f"FROM {TABLE}")
-    where: list[str] = []
-    args: list = []
-    q = (q or "").strip()
-    if q:
-        where.append("(company_number ILIKE %s OR psc_name ILIKE %s)")
-        args += [f"%{q}%", f"%{q}%"]
-    if not include_ceased:
-        where.append("(ceased_on IS NULL OR ceased_on = '')")
-    if where:
-        sql += " WHERE " + " AND ".join(where)
+    clause, args = _where(q, include_ceased)
+    sql += clause
     sql += " ORDER BY company_number LIMIT %s OFFSET %s"
     args += [max(1, min(int(limit), 500)), max(0, int(offset))]
     with db._cursor() as cur:
