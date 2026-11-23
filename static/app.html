@@ -2569,6 +2569,9 @@ function openAddModal() {
   updateYearLabel();
   document.getElementById("add-overlay").classList.add("open");
   setTimeout(() => document.getElementById("add-input").focus(), 50);
+  // Show the candidates immediately. A dialog that opens blank and waits
+  // to be typed into hides the fact that we already hold the list.
+  loadCandidates("");
 }
 
 function closeAddModal() {
@@ -2633,14 +2636,96 @@ function updateYearLabel() {
 document.getElementById("add-input").addEventListener("input", e => {
   clearTimeout(S.addDebounce);
   const q = e.target.value.trim();
-  if (q.length < 2) {
-    document.getElementById("add-results").innerHTML = "";
-    document.getElementById("add-status").textContent = "";
+  // An empty box means "show me everything", not "show me nothing". The
+  // dialog used to clear itself below two characters, so an operator who
+  // deleted what they typed was back to a blank screen.
+  S.addDebounce = setTimeout(() => loadCandidates(q), q ? 220 : 0);
+});
+
+// ── The candidate list ────────────────────────────────────────────────────
+//
+// Opening the dialog shows the companies we already hold, rather than
+// demanding a search. These come from the PSC index, so they are already
+// the ones worth offering; Companies House cannot be searched by
+// nationality, which is why typing a name used to return mostly companies
+// that then had to be hidden again.
+//
+// A row is a CANDIDATE, not an approval. It says a Kenyan person controls
+// the company; the pipeline's rule is about DIRECTORS, and that is checked
+// when the company is added. The footer says so rather than letting the
+// list imply these are pre-approved.
+
+async function loadCandidates(q) {
+  const status = document.getElementById("add-status");
+  const el = document.getElementById("add-results");
+  status.innerHTML = `<span class="spinner" style="width:10px;height:10px;border-width:2px;vertical-align:middle;margin-right:4px;"></span> Loading…`;
+  let d;
+  try {
+    d = await api("GET", "/api/v2/company/candidates?q=" + encodeURIComponent(q || ""));
+  } catch (e) {
+    status.textContent = "Could not read the index: " + e.message;
+    el.innerHTML = "";
     return;
   }
-  document.getElementById("add-status").innerHTML = `<span class="spinner" style="width:10px;height:10px;border-width:2px;vertical-align:middle;margin-right:4px;"></span> Searching…`;
-  S.addDebounce = setTimeout(() => doAddSearch(q), 380);
-});
+  const rows = d.rows || [];
+  const ix = d.index || {};
+
+  if (!rows.length) {
+    // Two different empties, and they need different next steps. An index
+    // that was never built is a job for the admin page; an index that
+    // simply has no match for this text is a reason to ask Companies House.
+    if (!ix.rows) {
+      status.innerHTML = `The company index is empty. Build it from `
+        + `<a href="/admin" target="_blank">the admin page</a> `
+        + `&mdash; or type a name or number to search Companies House directly.`;
+      el.innerHTML = "";
+      if ((q || "").length >= 2) doAddSearch(q);
+      return;
+    }
+    status.innerHTML = `Nothing in the index matches that. Searching `
+      + `Companies House instead&hellip;`;
+    el.innerHTML = "";
+    if ((q || "").length >= 2) doAddSearch(q);
+    return;
+  }
+
+  status.innerHTML = `${rows.length} of <b>${ix.current_companies || ix.companies || 0}</b> `
+    + `companies with a Kenyan person of significant control`
+    + (ix.snapshot_date ? ` (register of ${x(ix.snapshot_date)})` : "")
+    + `. <span style="font-size:11px;color:var(--muted)">Click one to add it. `
+    + `The director rule is checked as it is added &mdash; a controlling `
+    + `shareholder is not automatically a director.</span>`;
+
+  el.innerHTML = rows.map(r => {
+    let badge;
+    if (!r.in_pipeline) {
+      badge = `<span class="badge badge-gray">not started</span>`;
+    } else if (r.n_done >= r.total_stages) {
+      badge = `<span class="badge badge-green">completed ${r.n_done}/${r.total_stages}</span>`;
+    } else {
+      badge = `<span class="badge badge-orange">in progress ${r.n_done}/${r.total_stages}</span>`;
+    }
+    const name = r.name || "(name not fetched yet)";
+    return `<div class="sri" data-cn="${x(r.cn)}" data-name="${x(r.name)}" data-doc=""
+              ${r.in_pipeline ? 'style="opacity:.75"' : ""}>
+      <div>
+        <div class="sri-name">${x(name)}</div>
+        <div class="sri-sub">${x(r.cn)}
+          ${r.psc_name ? " &middot; PSC " + x(r.psc_name) : ""}
+          ${r.nationality ? " &middot; " + x(r.nationality) : ""}
+          ${r.company_status && r.company_status !== "active"
+            ? ' &middot; <span style="color:var(--orange)">' + x(r.company_status) + "</span>" : ""}
+        </div>
+      </div>
+      <div class="sri-right">${badge}</div>
+    </div>`;
+  }).join("");
+
+  el.querySelectorAll(".sri[data-cn]").forEach(row => {
+    row.addEventListener("click", () =>
+      addCompany(row.dataset.cn, row.dataset.name, row.dataset.doc));
+  });
+}
 
 // The deep search is a DELIBERATE action, never a keystroke. The box is a
 // type-ahead on a 120ms debounce, so a per-keystroke budget has to stay

@@ -1512,9 +1512,12 @@ def v2_search():
         resp["kenyan_filtered"] = kenyan_excluded
         resp["kenyan_note"] = kenyan_note
     if ch_candidates:
+        # Second stale copy of the same sentence, found by grepping for the
+        # phrase after fixing the one in v2_add_company. The clause about
+        # unrecorded nationality was dropped from the rule in c9c99b6 and
+        # both descriptions of it were left behind.
         resp["kenyan_rule"] = ("only companies with at least one Kenyan "
-                               "director, and none whose nationality is "
-                               "unrecorded")
+                               "director")
         # How broad the query was. total_results is a top-level key of the
         # search response (measured: 1 for a company number, 1014 for
         # "kenya airways", 10000 for "consulting"), so this costs nothing.
@@ -1540,6 +1543,118 @@ def v2_search():
                 + " Entering the 8-character company number checks one"
                   " exactly.")
     return jsonify(resp)
+
+
+def _profile_name(cn: str) -> tuple[str, str]:
+    """(company_name, company_status) from Companies House, or ("", "").
+
+    Same short-timeout, no-retry fetch as the rest of this module, for the
+    same reason: it runs on one of eight gunicorn threads and a failure
+    must give up rather than wait.
+    """
+    key = os.getenv("COMPANIES_HOUSE_API_KEY", "")
+    if not key:
+        return "", ""
+    try:
+        r = _ch_session.get(
+            f"https://api.company-information.service.gov.uk/company/{cn}",
+            auth=(key, ""), timeout=8)
+    except Exception:
+        return "", ""
+    rem = r.headers.get("X-Ratelimit-Remain")
+    if rem is not None:
+        try:
+            _ch_remain[0] = int(rem)
+        except ValueError:
+            pass
+    if r.status_code != 200:
+        return "", ""
+    d = r.json()
+    return str(d.get("company_name") or ""), str(d.get("company_status") or "")
+
+
+@api_v2.route("/api/v2/company/candidates")
+def v2_candidates():
+    """The companies an operator can choose from, with their pipeline state.
+
+    The Add dialog used to show nothing until somebody typed, and then
+    searched Companies House BY NAME - which cannot be filtered by
+    nationality, so most of what it returned was ineligible and had to be
+    hidden again after spending a request per candidate to find out.
+
+    The PSC index already holds the companies worth offering. This lists
+    them, says which are already in the pipeline and how far along, and
+    leaves the admission rule where it belongs: v2_add_company checks it at
+    the write, so nothing here can admit an ineligible company by listing
+    it.
+
+    THE LIST IS NOT AN ADMISSION. A row says a Kenyan person CONTROLS the
+    company; the pipeline's rule is about DIRECTORS. The two usually agree
+    and are not the same fact, so the rule is checked on add and the dialog
+    says so rather than implying these are pre-approved.
+    """
+    import psc_index
+
+    q = request.args.get("q", "").strip()
+    limit = max(1, min(request.args.get("limit", default=25, type=int), 200))
+    offset = max(0, request.args.get("offset", default=0, type=int))
+    # Bounded name lookups per call. Zero on later calls for the same rows:
+    # the name is written back to the index, so this cost extinguishes.
+    enrich = max(0, min(request.args.get("enrich", default=25, type=int), 50))
+
+    try:
+        rows = psc_index.search(q=q, limit=limit, offset=offset)
+    except Exception as e:
+        return jsonify({"error": f"the PSC index could not be read: {e}",
+                        "rows": []}), 200
+
+    # Pipeline state for every company already in the system. One pass, so
+    # a long candidate list does not become N queries.
+    try:
+        pipeline_rows = {_cn8(r.get("Company Number")): r for r in _all_rows()}
+    except DatabaseUnavailable:
+        pipeline_rows = {}
+
+    need = [r for r in rows if not r.get("company_name")][:enrich]
+    if need:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            got = list(pool.map(lambda r: _profile_name(r["company_number"]),
+                                need))
+        for r, (nm, st) in zip(need, got):
+            if nm:
+                r["company_name"] = nm
+                r["company_status"] = st
+                try:
+                    psc_index.record_company_facts(
+                        r["company_number"], company_name=nm,
+                        company_status=st)
+                except Exception:
+                    pass        # a cached name is a convenience, not the answer
+
+    out = []
+    for r in rows:
+        cn = r["company_number"]
+        prow = pipeline_rows.get(cn)
+        entry = {
+            "cn": cn,
+            "name": r.get("company_name") or "",
+            "company_status": r.get("company_status") or "",
+            "psc_name": r.get("psc_name") or "",
+            "nationality": r.get("nationality") or "",
+            "director_verdict": r.get("director_verdict") or "",
+            "in_pipeline": prow is not None,
+            "n_done": 0,
+            "total_stages": len(STAGE_ORDER),
+        }
+        if prow is not None:
+            stages = _compute_stages(cn, prow)
+            entry["n_done"] = sum(1 for s in STAGE_ORDER if stages.get(s))
+            entry["name"] = entry["name"] or str(prow.get("Company Name") or "")
+        out.append(entry)
+
+    return jsonify({"rows": out, "index": psc_index.status(),
+                    "offset": offset, "limit": limit})
 
 
 @api_v2.route("/api/v2/company/add", methods=["POST"])
@@ -1570,8 +1685,13 @@ def v2_add_company():
             "error": "not eligible",
             "cn": cn,
             "reason": why,
-            "rule": ("only companies with at least one Kenyan director, and "
-                     "none whose nationality is unrecorded, may be added"),
+            # The clause "and none whose nationality is unrecorded" used to
+            # follow, and was removed from _kenyan_verdict in c9c99b6. The
+            # ENFORCEMENT here was always a single call to _fetch_kenyan and
+            # so was never wrong; only this sentence was, and it told an
+            # operator a rule the system had stopped applying.
+            "rule": ("only companies with at least one Kenyan director "
+                     "may be added"),
         }), 422
 
     _add_company_row(cn, name, doc)
